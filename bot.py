@@ -3,249 +3,168 @@
 
 import os
 import time
+import json
 import zipfile
-import subprocess
-import logging
 import requests
-from bs4 import BeautifulSoup
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
-from telegram.constants import ChatAction
+import threading
+from datetime import datetime
+from flask import Flask, request, jsonify
 
 # ========== CONFIGURACIÓN ==========
-TOKEN = "8723078700:AAGr_-qY3zhbXBRlxS-6aLWR6hQ8_O-fTDY"  # ← CAMBIA ESTO POR TU TOKEN REAL
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+BOT_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+URL_BASE = os.environ.get("URL_BASE", "https://oops.uclv.edu.cu/")
+LIMITE_2GB = 2 * 1024 * 1024 * 1024
 
-# Directorios
+# Directorios temporales
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DESCARGAS_DIR = os.path.join(BASE_DIR, "descargas")
 COMPRIMIDOS_DIR = os.path.join(BASE_DIR, "comprimidos")
 PARTES_DIR = os.path.join(BASE_DIR, "partes")
-LOGS_DIR = os.path.join(BASE_DIR, "logs")
 
-for d in [DESCARGAS_DIR, COMPRIMIDOS_DIR, PARTES_DIR, LOGS_DIR]:
+for d in [DESCARGAS_DIR, COMPRIMIDOS_DIR, PARTES_DIR]:
     os.makedirs(d, exist_ok=True)
 
-# Configurar logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO,
-    handlers=[
-        logging.FileHandler(os.path.join(LOGS_DIR, "bot.log")),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
+# ========== FUNCIONES DEL BOT ==========
+def enviar_mensaje(chat_id, texto):
+    """Envía un mensaje a Telegram"""
+    url = f"{BOT_URL}/sendMessage"
+    try:
+        requests.post(url, json={"chat_id": chat_id, "text": texto, "parse_mode": "Markdown"}, timeout=10)
+    except Exception as e:
+        print(f"Error enviando mensaje: {e}")
 
-# Constantes
-LIMITE_2GB = 2 * 1024 * 1024 * 1024
-TAMANO_PARTE_MB = 1900
-
-# ========== FUNCIONES ==========
-def get_file_size(path):
-    return os.path.getsize(path)
-
-def compress_folder(folder_path, output_name):
-    """Comprime una carpeta a ZIP"""
-    output_path = os.path.join(COMPRIMIDOS_DIR, output_name)
-    with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-        for root, dirs, files in os.walk(folder_path):
-            for file in files:
-                file_path = os.path.join(root, file)
-                arcname = os.path.relpath(file_path, folder_path)
-                zipf.write(file_path, arcname)
-    return output_path
-
-def split_file(file_path):
-    """Divide archivo usando split"""
-    base_name = os.path.basename(file_path)
-    output_pattern = os.path.join(PARTES_DIR, f"{base_name}.part")
-    part_size = TAMANO_PARTE_MB * 1024 * 1024
-    
-    cmd = f"split -b {part_size} '{file_path}' '{output_pattern}'"
-    subprocess.run(cmd, shell=True, check=True)
-    
-    parts = sorted([os.path.join(PARTES_DIR, f) for f in os.listdir(PARTES_DIR) 
-                    if f.startswith(base_name + ".part")])
-    return parts
+def enviar_documento(chat_id, archivo_path, caption=""):
+    """Envía un documento a Telegram"""
+    url = f"{BOT_URL}/sendDocument"
+    try:
+        with open(archivo_path, 'rb') as f:
+            requests.post(url, data={"chat_id": chat_id, "caption": caption}, files={"document": f}, timeout=60)
+        return True
+    except Exception as e:
+        print(f"Error enviando documento: {e}")
+        return False
 
 def descargar_archivo(url, destino):
-    """Descarga un archivo"""
+    """Descarga un archivo desde URL"""
     nombre = os.path.basename(url)
     if not nombre or '.' not in nombre:
         nombre = f"descarga_{int(time.time())}"
-    
     ruta = os.path.join(destino, nombre)
-    response = requests.get(url, stream=True)
+    response = requests.get(url, stream=True, timeout=60)
     response.raise_for_status()
-    
     with open(ruta, 'wb') as f:
         for chunk in response.iter_content(chunk_size=8192):
             f.write(chunk)
     return ruta
 
-def listar_contenido_carpeta(url):
-    """Lista archivos en carpeta web"""
+def dividir_archivo(archivo_path, tamaño_parte_mb=1900):
+    """Divide un archivo en partes (comando split de Linux)"""
+    import subprocess
+    parte_size = tamaño_parte_mb * 1024 * 1024
+    base = os.path.basename(archivo_path)
+    patron = os.path.join(PARTES_DIR, f"{base}.part")
+    subprocess.run(f"split -b {parte_size} '{archivo_path}' '{patron}'", shell=True, check=True)
+    partes = sorted([os.path.join(PARTES_DIR, f) for f in os.listdir(PARTES_DIR) if f.startswith(base + ".part")])
+    return partes
+
+def procesar_descarga(chat_id, url):
+    """Procesa una solicitud de descarga"""
     try:
-        response = requests.get(url)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
+        enviar_mensaje(chat_id, f"🔄 *Procesando:* `{url[:80]}...`")
         
-        enlaces = []
-        for a in soup.find_all('a'):
-            href = a.get('href')
-            if href and href != '../' and not href.startswith('?'):
-                if not href.endswith('/'):  # Solo archivos, no subcarpetas
-                    full_url = url.rstrip('/') + '/' + href
-                    enlaces.append(full_url)
-        return enlaces
+        # Descargar
+        enviar_mensaje(chat_id, "📥 Descargando archivo...")
+        archivo = descargar_archivo(url, DESCARGAS_DIR)
+        tamaño = os.path.getsize(archivo)
+        
+        if tamaño <= LIMITE_2GB:
+            enviar_mensaje(chat_id, f"📤 Subiendo archivo... ({tamaño/(1024**2):.1f}MB)")
+            enviar_documento(chat_id, archivo, f"✅ {os.path.basename(archivo)}")
+        else:
+            enviar_mensaje(chat_id, f"✂️ Archivo de {tamaño/(1024**3):.2f}GB, dividiendo...")
+            partes = dividir_archivo(archivo)
+            for i, parte in enumerate(partes, 1):
+                enviar_mensaje(chat_id, f"📤 Subiendo parte {i}/{len(partes)}")
+                enviar_documento(chat_id, parte, f"📦 {os.path.basename(archivo)} - Parte {i}")
+        
+        enviar_mensaje(chat_id, "✅ *Descarga completada*")
+        
     except Exception as e:
-        logger.error(f"Error listando carpeta: {e}")
-        return []
+        enviar_mensaje(chat_id, f"❌ *Error:* `{str(e)[:150]}`")
+    finally:
+        # Limpiar archivos temporales
+        for d in [DESCARGAS_DIR, COMPRIMIDOS_DIR, PARTES_DIR]:
+            for f in os.listdir(d):
+                try:
+                    os.remove(os.path.join(d, f))
+                except:
+                    pass
 
-# ========== FUNCIONES DEL BOT ==========
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 *Bot Visuales UCLV*\n\n"
-        "📌 *Comandos:*\n"
-        "/descargar `<url>` - Descargar archivo\n"
-        "/estado - Estado del bot\n"
-        "/limpiar - Limpiar temporales\n"
-        "/ayuda - Esta ayuda\n\n"
-        "_Los archivos >2GB se dividen automáticamente_",
-        parse_mode="Markdown"
-    )
+# ========== SERVIDOR FLASK ==========
+app = Flask(__name__)
 
-async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📖 *Ayuda*\n\n"
-        "`/descargar https://oops.uclv.edu.cu/archivo.mp4`\n\n"
-        "✅ Archivos <2GB → envío directo\n"
-        "✂️ Archivos >2GB → partes de 1.9GB\n"
-        "📁 Carpetas → comprimidas en ZIP",
-        parse_mode="Markdown"
-    )
+@app.route('/')
+def home():
+    return {"status": "Bot activo", "version": "1.0"}
 
-async def estado(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uso = 0
-    archivos = 0
-    for dir_path in [DESCARGAS_DIR, COMPRIMIDOS_DIR, PARTES_DIR]:
-        for f in os.listdir(dir_path):
-            fp = os.path.join(dir_path, f)
-            if os.path.isfile(fp):
-                uso += os.path.getsize(fp)
-                archivos += 1
-    
-    await update.message.reply_text(
-        f"📊 *Estado*\n\n"
-        f"✅ Activo\n"
-        f"💾 {uso/(1024**3):.2f} GB usados\n"
-        f"📁 {archivos} archivos temporales",
-        parse_mode="Markdown"
-    )
+@app.route('/health')
+def health():
+    return {"status": "healthy"}
 
-async def limpiar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    eliminados = 0
-    for dir_path in [DESCARGAS_DIR, COMPRIMIDOS_DIR, PARTES_DIR]:
-        for f in os.listdir(dir_path):
-            os.remove(os.path.join(dir_path, f))
-            eliminados += 1
-    await update.message.reply_text(f"🧹 Limpiados {eliminados} archivos")
+@app.route(f'/webhook', methods=['POST'])
+def webhook():
+    """Recibe mensajes de Telegram"""
+    try:
+        update = request.get_json()
+        if 'message' in update:
+            msg = update['message']
+            chat_id = msg['chat']['id']
+            text = msg.get('text', '')
+            
+            # Comandos
+            if text.startswith('/start'):
+                enviar_mensaje(chat_id, "🤖 *Bot activo*\n\nEnvía /descargar <url>")
+            elif text.startswith('/descargar'):
+                parts = text.split(maxsplit=1)
+                if len(parts) == 2:
+                    # Ejecutar en hilo separado para no bloquear
+                    thread = threading.Thread(target=procesar_descarga, args=(chat_id, parts[1]))
+                    thread.start()
+                    enviar_mensaje(chat_id, "🔄 *Descarga iniciada en segundo plano...*")
+                else:
+                    enviar_mensaje(chat_id, "❌ Uso: `/descargar <url>`")
+            elif text == '/help' or text == '/ayuda':
+                enviar_mensaje(chat_id, "📖 *Comandos:*\n/descargar <url> - Descargar archivo\n/start - Iniciar bot\n/estado - Ver estado")
+            elif text == '/estado':
+                enviar_mensaje(chat_id, "✅ Bot activo\n💾 Espacio: 1GB temporal")
+            else:
+                enviar_mensaje(chat_id, "Comando no reconocido. Usa /ayuda")
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        print(f"Error en webhook: {e}")
+        return jsonify({"status": "error"}), 500
 
-async def descargar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("❌ Uso: `/descargar <URL>`", parse_mode="Markdown")
+# ========== CONFIGURAR WEBHOOK ==========
+def set_webhook():
+    if not TELEGRAM_TOKEN:
+        print("ERROR: TELEGRAM_TOKEN no configurado")
         return
-    
-    url = context.args[0]
-    msg = await update.message.reply_text(f"🔄 *Procesando...*", parse_mode="Markdown")
-    
-    try:
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_DOCUMENT)
-        
-        # Verificar si es carpeta o archivo
-        if url.endswith('/'):
-            await msg.edit_text("📁 *Carpeta detectada*\nListando contenido...", parse_mode="Markdown")
-            archivos = listar_contenido_carpeta(url)
-            
-            if not archivos:
-                await msg.edit_text("❌ No se encontraron archivos", parse_mode="Markdown")
-                return
-            
-            await msg.edit_text(f"📥 Descargando {len(archivos)} archivos...")
-            descargados = []
-            for i, file_url in enumerate(archivos):
-                await msg.edit_text(f"📥 ({i+1}/{len(archivos)}): {os.path.basename(file_url)}", parse_mode="Markdown")
-                archivo_path = descargar_archivo(file_url, DESCARGAS_DIR)
-                descargados.append(archivo_path)
-            
-            await msg.edit_text("🗜️ Comprimiendo...")
-            zip_name = f"carpeta_{int(time.time())}.zip"
-            zip_path = compress_folder(DESCARGAS_DIR, zip_name)
-            
-            for f in descargados:
-                os.remove(f)
-            
-            tamaño = get_file_size(zip_path)
-            
-            if tamaño <= LIMITE_2GB:
-                await msg.edit_text(f"📤 Subiendo ({tamaño/(1024**2):.1f}MB)...")
-                await context.bot.send_document(chat_id=update.effective_chat.id, document=open(zip_path, 'rb'))
-                await msg.delete()
-            else:
-                await msg.edit_text(f"✂️ Dividiendo ({tamaño/(1024**3):.2f}GB)...")
-                partes = split_file(zip_path)
-                for i, parte in enumerate(partes, 1):
-                    await context.bot.send_document(
-                        chat_id=update.effective_chat.id,
-                        document=open(parte, 'rb'),
-                        caption=f"📦 Parte {i}/{len(partes)}"
-                    )
-                await msg.delete()
-        
-        else:  # Es archivo
-            await msg.edit_text("📥 *Descargando archivo...*", parse_mode="Markdown")
-            archivo_path = descargar_archivo(url, DESCARGAS_DIR)
-            tamaño = get_file_size(archivo_path)
-            
-            if tamaño <= LIMITE_2GB:
-                await msg.edit_text(f"📤 Subiendo ({tamaño/(1024**2):.1f}MB)...")
-                await context.bot.send_document(chat_id=update.effective_chat.id, document=open(archivo_path, 'rb'))
-                await msg.delete()
-            else:
-                await msg.edit_text(f"✂️ Archivo de {tamaño/(1024**3):.2f}GB\nDividiendo...", parse_mode="Markdown")
-                partes = split_file(archivo_path)
-                for i, parte in enumerate(partes, 1):
-                    await context.bot.send_document(
-                        chat_id=update.effective_chat.id,
-                        document=open(parte, 'rb'),
-                        caption=f"✂️ Parte {i}/{len(partes)}"
-                    )
-                await msg.delete()
-        
-        # Limpiar archivos temporales después de enviar
-        for dir_path in [DESCARGAS_DIR, COMPRIMIDOS_DIR, PARTES_DIR]:
-            for f in os.listdir(dir_path):
-                os.remove(os.path.join(dir_path, f))
-                
-    except Exception as e:
-        logger.error(f"Error: {e}")
-        await msg.edit_text(f"❌ *Error:* `{str(e)[:150]}`", parse_mode="Markdown")
+    webhook_url = os.environ.get("RENDER_EXTERNAL_URL", os.environ.get("WEBHOOK_URL"))
+    if not webhook_url:
+        print("ERROR: WEBHOOK_URL no configurado")
+        return
+    url = f"{BOT_URL}/setWebhook?url={webhook_url}/webhook"
+    response = requests.get(url)
+    print(f"Webhook configurado: {response.json()}")
 
 # ========== MAIN ==========
-def main():
-    app = Application.builder().token(TOKEN).build()
-    
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("ayuda", ayuda))
-    app.add_handler(CommandHandler("estado", estado))
-    app.add_handler(CommandHandler("limpiar", limpiar))
-    app.add_handler(CommandHandler("descargar", descargar))
-    
-    print("="*50)
-    print("🤖 BOT INICIADO")
-    print("="*50)
-    
-    app.run_polling()
-
 if __name__ == "__main__":
-    main()
+    port = int(os.environ.get("PORT", 8080))
+    
+    # Configurar webhook al iniciar
+    time.sleep(2)  # Pequeña pausa para que el servidor esté listo
+    set_webhook()
+    
+    print(f"Iniciando bot en puerto {port}")
+    app.run(host='0.0.0.0', port=port)

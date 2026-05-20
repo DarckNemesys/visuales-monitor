@@ -2,12 +2,12 @@ services:
   - type: web
     name: visuales-bot
     runtime: python
-    repo: https://github.com/tu-usuario/tu-repo
+    repo: https://github.com/DarckNemesys/visuales-bot
     plan: free
     envVars:
-      - key: BOT_TOKEN
+      - key: TELEGRAM_TOKEN
         sync: false
       - key: WEBHOOK_URL
         value: https://visuales-bot.onrender.com
     buildCommand: pip install -r requirements.txt
-    startCommand: python bot_webhook.py
+    startCommand: python bot_descargador.py
