@@ -4,12 +4,14 @@
 import os
 import time
 import json
+import hashlib
 import zipfile
 import logging
 import subprocess
 import requests
 import threading
 from datetime import datetime
+from bs4 import BeautifulSoup
 from flask import Flask, request, jsonify
 
 # ========== CONFIGURACIÓN ==========
@@ -21,6 +23,7 @@ WEBHOOK_URL = os.environ.get("RENDER_EXTERNAL_URL", os.environ.get("WEBHOOK_URL"
 if not WEBHOOK_URL:
     WEBHOOK_URL = "https://visuales-bot.onrender.com"
 
+URL_BASE = os.environ.get("URL_BASE", "https://oops.uclv.edu.cu/")
 LIMITE_2GB = 2 * 1024 * 1024 * 1024
 TAMANO_PARTE_MB = 1900
 
@@ -29,6 +32,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DESCARGAS_DIR = os.path.join(BASE_DIR, "descargas")
 COMPRIMIDOS_DIR = os.path.join(BASE_DIR, "comprimidos")
 PARTES_DIR = os.path.join(BASE_DIR, "partes")
+ESTADO_FILE = os.path.join(BASE_DIR, "estado_visuales.json")
 
 for d in [DESCARGAS_DIR, COMPRIMIDOS_DIR, PARTES_DIR]:
     os.makedirs(d, exist_ok=True)
@@ -38,19 +42,16 @@ logger = logging.getLogger(__name__)
 
 # ========== FUNCIONES DE TELEGRAM ==========
 def enviar_mensaje(chat_id, texto):
-    """Envía un mensaje a Telegram"""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
         payload = {"chat_id": chat_id, "text": texto, "parse_mode": "Markdown"}
         response = requests.post(url, json=payload, timeout=10)
-        logger.info(f"Mensaje enviado a {chat_id}: {response.status_code}")
         return response.ok
     except Exception as e:
         logger.error(f"Error enviando mensaje: {e}")
         return False
 
 def enviar_documento(chat_id, archivo_path, caption=""):
-    """Envía un documento a Telegram"""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
     try:
         with open(archivo_path, 'rb') as f:
@@ -63,7 +64,6 @@ def enviar_documento(chat_id, archivo_path, caption=""):
         return False
 
 def set_webhook():
-    """Configura el webhook en Telegram"""
     webhook_url = f"{WEBHOOK_URL}/webhook"
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook?url={webhook_url}"
     try:
@@ -78,9 +78,112 @@ def set_webhook():
         logger.error(f"Error en setWebhook: {e}")
         return None
 
+# ========== FUNCIONES DE MONITOREO ==========
+def obtener_contenido_web(url):
+    try:
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        return response.text
+    except Exception as e:
+        logger.error(f"Error obteniendo {url}: {e}")
+        return None
+
+def extraer_items(html, base_url):
+    from urllib.parse import urljoin
+    soup = BeautifulSoup(html, 'html.parser')
+    items = []
+    for a in soup.find_all('a'):
+        href = a.get('href')
+        if not href or href == '../' or href.startswith('?'):
+            continue
+        full_url = urljoin(base_url, href)
+        tipo = 'carpeta' if href.endswith('/') else 'archivo'
+        nombre = href.rstrip('/') if href.endswith('/') else href
+        items.append({'nombre': nombre, 'tipo': tipo, 'url': full_url})
+    return items
+
+def obtener_hash(items):
+    return hashlib.md5(json.dumps(items, sort_keys=True).encode()).hexdigest()
+
+def guardar_estado(items, hash_val):
+    with open(ESTADO_FILE, 'w') as f:
+        json.dump({'timestamp': datetime.now().isoformat(), 'hash': hash_val, 'items': items}, f)
+
+def cargar_estado():
+    try:
+        with open(ESTADO_FILE, 'r') as f:
+            return json.load(f)
+    except:
+        return None
+
+def monitorear_y_notificar(chat_id=None):
+    """Función de monitoreo. Si se provee chat_id, envía resultado al chat."""
+    logger.info("Iniciando monitoreo...")
+    resultado = {
+        'cambios': False,
+        'nuevos': [],
+        'eliminados': [],
+        'mensaje': ''
+    }
+    
+    html = obtener_contenido_web("https://visuales.uclv.cu/")
+    if not html:
+        html = obtener_contenido_web(URL_BASE)
+    if not html:
+        logger.error("No se pudo obtener la web")
+        if chat_id:
+            enviar_mensaje(chat_id, "❌ *Error:* No se pudo conectar con visuales.uclv.cu")
+        return resultado
+    
+    items = extraer_items(html, URL_BASE)
+    hash_actual = obtener_hash(items)
+    estado = cargar_estado()
+    
+    if not estado:
+        guardar_estado(items, hash_actual)
+        if chat_id:
+            enviar_mensaje(chat_id, f"📊 *Primer escaneo completado*\n\n📁 Total carpetas: {len([i for i in items if i['tipo'] == 'carpeta'])}\n📄 Total archivos: {len([i for i in items if i['tipo'] == 'archivo'])}")
+        resultado['mensaje'] = "Estado inicial guardado"
+        return resultado
+    
+    if hash_actual == estado['hash']:
+        if chat_id:
+            enviar_mensaje(chat_id, "✅ *Sin cambios*\nNo se detectó nuevo contenido en visuales.uclv.cu")
+        resultado['mensaje'] = "Sin cambios"
+        return resultado
+    
+    # Hay cambios
+    urls_antiguas = {i['url'] for i in estado['items']}
+    urls_actuales = {i['url'] for i in items}
+    
+    nuevos = [i for i in items if i['url'] not in urls_antiguas]
+    eliminados = [i for i in estado['items'] if i['url'] not in urls_actuales]
+    
+    resultado['cambios'] = True
+    resultado['nuevos'] = nuevos
+    resultado['eliminados'] = eliminados
+    
+    if chat_id:
+        mensaje = f"📢 *CAMBIOS DETECTADOS* en visuales.uclv.cu\n🕐 {datetime.now().strftime('%d/%m/%Y %H:%M')}\n\n"
+        if nuevos:
+            mensaje += f"🆕 *Nuevos ({len(nuevos)}):*\n"
+            for item in nuevos[:10]:
+                mensaje += f"• `{item['nombre']}` ({item['tipo']})\n"
+            if len(nuevos) > 10:
+                mensaje += f"... y {len(nuevos)-10} más\n"
+        if eliminados:
+            mensaje += f"\n🗑️ *Eliminados ({len(eliminados)}):*\n"
+            for item in eliminados[:5]:
+                mensaje += f"• `{item['nombre']}`\n"
+        mensaje += f"\n💡 Usa `/descargar <url>` para bajar el contenido"
+        enviar_mensaje(chat_id, mensaje)
+    
+    guardar_estado(items, hash_actual)
+    resultado['mensaje'] = f"{len(nuevos)} nuevos, {len(eliminados)} eliminados"
+    return resultado
+
 # ========== FUNCIONES DE DESCARGA ==========
 def descargar_archivo(url, destino):
-    """Descarga un archivo desde URL"""
     nombre = os.path.basename(url)
     if not nombre or '.' not in nombre:
         nombre = f"descarga_{int(time.time())}"
@@ -96,7 +199,6 @@ def descargar_archivo(url, destino):
     return ruta
 
 def dividir_archivo(archivo_path):
-    """Divide un archivo usando split de Linux"""
     parte_size = TAMANO_PARTE_MB * 1024 * 1024
     base = os.path.basename(archivo_path)
     patron = os.path.join(PARTES_DIR, f"{base}.part")
@@ -109,7 +211,6 @@ def dividir_archivo(archivo_path):
     return partes
 
 def limpiar_temporales():
-    """Limpia todos los directorios temporales"""
     for dir_path in [DESCARGAS_DIR, COMPRIMIDOS_DIR, PARTES_DIR]:
         for f in os.listdir(dir_path):
             try:
@@ -119,7 +220,6 @@ def limpiar_temporales():
     logger.info("Archivos temporales limpiados")
 
 def procesar_descarga(chat_id, url):
-    """Procesa una solicitud de descarga"""
     try:
         enviar_mensaje(chat_id, f"🔄 *Procesando:* `{url[:80]}...`")
         
@@ -160,23 +260,19 @@ def health():
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    """Recibe y procesa mensajes de Telegram"""
     try:
         update = request.get_json()
-        logger.info(f"Webhook recibido: {update}")
+        logger.info(f"Webhook recibido")
         
-        # Procesar mensaje
         if 'message' in update:
             msg = update['message']
             chat_id = msg['chat']['id']
+            text = msg.get('text', '').strip()
             
-            # Obtener texto del mensaje
-            text = msg.get('text', '')
             if not text:
                 return jsonify({"status": "ok"})
             
-            text = text.strip()
-            logger.info(f"Comando: '{text}' de chat {chat_id}")
+            logger.info(f"Comando: {text} de {chat_id}")
             
             # ========== COMANDOS ==========
             if text == '/start':
@@ -184,21 +280,24 @@ def webhook():
                     "🤖 *Bot de Visuales UCLV*\n\n"
                     "📌 *Comandos:*\n"
                     "`/descargar <url>` - Descargar archivo\n"
+                    "`/monitorear` - Escanear web manualmente\n"
                     "`/estado` - Ver estado del bot\n"
-                    "`/limpiar` - Limpiar archivos temporales\n"
-                    "`/ayuda` - Mostrar ayuda\n\n"
-                    "💡 *Ejemplo:*\n"
-                    "`/descargar https://oops.uclv.edu.cu/video.mp4`")
+                    "`/limpiar` - Limpiar temporales\n"
+                    "`/ayuda` - Mostrar ayuda")
             
             elif text.startswith('/descargar'):
                 partes = text.split(maxsplit=1)
                 if len(partes) == 2:
-                    url = partes[1]
-                    enviar_mensaje(chat_id, f"🔄 *Descarga iniciada en segundo plano para:*\n`{url[:80]}`")
-                    thread = threading.Thread(target=procesar_descarga, args=(chat_id, url))
+                    thread = threading.Thread(target=procesar_descarga, args=(chat_id, partes[1]))
                     thread.start()
+                    enviar_mensaje(chat_id, "🔄 *Descarga iniciada en segundo plano...*")
                 else:
-                    enviar_mensaje(chat_id, "❌ *Uso correcto:* `/descargar <url>`")
+                    enviar_mensaje(chat_id, "❌ *Uso:* `/descargar <url>`")
+            
+            elif text == '/monitorear':
+                enviar_mensaje(chat_id, "🔍 *Escaneando visuales.uclv.cu...*\nEsto puede tomar unos segundos.")
+                thread = threading.Thread(target=monitorear_y_notificar, args=(chat_id,))
+                thread.start()
             
             elif text == '/estado':
                 uso = 0
@@ -209,13 +308,17 @@ def webhook():
                         if os.path.isfile(fp):
                             uso += os.path.getsize(fp)
                             archivos += 1
+                
+                estado = cargar_estado()
+                ultimo_escaneo = estado.get('timestamp', 'Nunca') if estado else 'Nunca'
+                
                 enviar_mensaje(chat_id,
                     f"📊 *Estado del bot*\n\n"
-                    f"✅ Bot activo\n"
+                    f"✅ Activo\n"
                     f"💾 Espacio usado: {uso/(1024**3):.2f} GB\n"
-                    f"📁 Archivos temporales: {archivos}\n"
-                    f"📦 Límite sin dividir: 2GB\n"
-                    f"✂️ Tamaño de parte: {TAMANO_PARTE_MB}MB")
+                    f"📁 Archivos temp: {archivos}\n"
+                    f"🔍 Último escaneo: {ultimo_escaneo[:16] if ultimo_escaneo != 'Nunca' else 'Nunca'}\n"
+                    f"📦 Límite: 2GB (dividido en {TAMANO_PARTE_MB}MB)")
             
             elif text == '/limpiar':
                 limpiar_temporales()
@@ -225,17 +328,16 @@ def webhook():
                 enviar_mensaje(chat_id,
                     "📖 *Ayuda del Bot*\n\n"
                     "🔹 `/descargar <url>` - Descarga un archivo\n"
+                    "🔹 `/monitorear` - Escanea la web por cambios\n"
                     "🔹 `/estado` - Ver estado del bot\n"
                     "🔹 `/limpiar` - Limpiar archivos temporales\n"
-                    "🔹 `/ayuda` - Mostrar esta ayuda\n\n"
+                    "🔹 `/ayuda` - Mostrar ayuda\n\n"
                     "⚙️ *Comportamiento:*\n"
                     "• Archivos <2GB → envío directo\n"
-                    "• Archivos >2GB → divididos en partes de 1.9GB\n\n"
-                    "📌 *Ejemplo:*\n"
-                    "`/descargar https://oops.uclv.edu.cu/video.mp4`")
+                    "• Archivos >2GB → divididos en partes de 1.9GB")
             
             else:
-                enviar_mensaje(chat_id, f"❌ *Comando no reconocido:* `{text}`\nUsa `/ayuda` para ver los comandos disponibles.")
+                enviar_mensaje(chat_id, f"❌ *Comando no reconocido:* `{text}`\nUsa `/ayuda`")
         
         return jsonify({"status": "ok"})
     
@@ -247,7 +349,6 @@ def webhook():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     
-    # Configurar webhook
     time.sleep(2)
     set_webhook()
     
