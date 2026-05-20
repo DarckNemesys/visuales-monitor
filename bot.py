@@ -5,6 +5,7 @@
 Bot de Telegram para Visuales UCLV
 Integra descarga de archivos y monitoreo de la web
 Detecta carpetas y lista su contenido automáticamente
+Corrige URLs de visuales.uclv.cu a oops.uclv.edu.cu
 """
 
 import os
@@ -52,7 +53,7 @@ logger = logging.getLogger(__name__)
 # Almacenamiento temporal para URLs de carpetas (para callbacks)
 temp_urls = {}
 
-# ========== UTILIDADES (de uclv_dowloader) ==========
+# ========== UTILIDADES ==========
 class URLUtils:
     @staticmethod
     def is_valid_url(url: str) -> bool:
@@ -110,6 +111,56 @@ class FileUtils:
         filename = urllib.parse.unquote(filename)
         filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
         return filename
+
+# ========== CORRECCIÓN DE URLS ==========
+def corregir_url_archivo(url: str) -> str:
+    """
+    Corrige URLs de visuales.uclv.cu a oops.uclv.edu.cu
+    También maneja URLs que parecen archivos pero están mal formadas
+    """
+    url_original = url
+    url = url.strip()
+    
+    # Si ya es oops, devolver igual
+    if 'oops.uclv.edu.cu' in url:
+        return url
+    
+    # Reemplazar visuales por oops
+    if 'visuales.uclv.cu' in url:
+        url = url.replace('visuales.uclv.cu', 'oops.uclv.edu.cu')
+        logger.info(f"URL corregida: {url_original} -> {url}")
+    
+    # Decodificar espacios y caracteres especiales
+    url = urllib.parse.unquote(url)
+    
+    return url
+
+def es_carpeta(url: str) -> bool:
+    """Detecta si una URL apunta a una carpeta"""
+    url_limpia = url.strip()
+    
+    # Termina con /
+    if url_limpia.endswith('/'):
+        return True
+    
+    # No tiene extensión de archivo conocida
+    partes = url_limpia.split('/')
+    ultimo = partes[-1]
+    
+    # Si tiene extensión de video o subtítulo, es archivo
+    extensiones_archivo = {'.mp4', '.mkv', '.avi', '.mov', '.srt', '.vtt', '.ass', '.jpg', '.png', '.pdf', '.zip'}
+    if any(ultimo.lower().endswith(ext) for ext in extensiones_archivo):
+        return False
+    
+    # Si no tiene punto o tiene punto pero es carpeta
+    if '.' not in ultimo:
+        return True
+    
+    # Si tiene extensión pero es de HTML o similar
+    if ultimo.endswith('.html') or ultimo.endswith('.htm') or ultimo.endswith('.php'):
+        return True
+    
+    return False
 
 # ========== FUNCIONES DE TELEGRAM ==========
 def enviar_mensaje(chat_id, texto):
@@ -196,15 +247,15 @@ def set_webhook():
 
 # ========== SCRAPING Y MONITOREO ==========
 def scrape_folder(url: str, recursive: bool = False, max_depth: int = 1) -> List[Dict]:
-    """
-    Escanea una carpeta y devuelve lista de archivos
-    recursive=False por defecto para no sobrecargar
-    """
+    """Escanea una carpeta y devuelve lista de archivos"""
     items = []
     
     # Asegurar que termina en /
     if not url.endswith('/'):
         url += '/'
+    
+    # Corregir URL si es necesario
+    url = corregir_url_archivo(url)
     
     try:
         response = requests.get(url, timeout=30)
@@ -223,11 +274,9 @@ def scrape_folder(url: str, recursive: bool = False, max_depth: int = 1) -> List
         full_url = URLUtils.build_full_url(url, href)
         
         if href.endswith('/') and recursive and max_depth > 0:
-            # Es carpeta - recursión (opcional)
             sub_items = scrape_folder(full_url, recursive, max_depth - 1)
             items.extend(sub_items)
         elif not href.endswith('/'):
-            # Es archivo
             file_type = FileUtils.get_file_type(href)
             items.append({
                 'name': href,
@@ -243,16 +292,19 @@ def listar_archivos_carpeta(chat_id: int, url_carpeta: str):
     global temp_urls
     
     try:
+        # Corregir URL
+        url_carpeta = corregir_url_archivo(url_carpeta)
+        
         # Asegurar que termina en /
         if not url_carpeta.endswith('/'):
             url_carpeta += '/'
         
         enviar_mensaje(chat_id, f"📁 *Explorando carpeta:*\n`{url_carpeta}`")
         
-        # Scrapear la carpeta (solo nivel actual, no recursivo)
+        # Scrapear la carpeta
         items = scrape_folder(url_carpeta, recursive=False, max_depth=0)
         
-        # Filtrar solo archivos (no subcarpetas)
+        # Filtrar solo archivos
         archivos = [item for item in items if item['type'] != 'other']
         
         if not archivos:
@@ -262,7 +314,7 @@ def listar_archivos_carpeta(chat_id: int, url_carpeta: str):
         # Iconos por tipo
         iconos = {'video': '🎬', 'subtitle': '📝', 'image': '🖼️', 'info': '📄'}
         
-        # Construir mensaje con la lista
+        # Construir mensaje
         mensaje = f"📁 *Archivos encontrados ({len(archivos)}):*\n\n"
         for i, archivo in enumerate(archivos[:20], 1):
             icono = iconos.get(archivo['type'], '📄')
@@ -279,7 +331,7 @@ def listar_archivos_carpeta(chat_id: int, url_carpeta: str):
         botones = []
         for i, archivo in enumerate(archivos[:10]):
             nombre_corto = archivo['name'][:40]
-            callback_id = f"desc_{i}_{int(time.time())}"
+            callback_id = f"desc_{i}_{int(time.time())}_{hash(archivo['url']) % 10000}"
             temp_urls[callback_id] = archivo['url']
             botones.append((f"{iconos.get(archivo['type'], '📄')} {nombre_corto}", callback_id))
         
@@ -292,7 +344,8 @@ def listar_archivos_carpeta(chat_id: int, url_carpeta: str):
 
 def check_for_changes(url: str, state_file: str) -> Dict:
     """Compara el estado actual con el guardado y devuelve cambios"""
-    current_items = scrape_folder(url, recursive=True, max_depth=2)
+    url_corregida = corregir_url_archivo(url)
+    current_items = scrape_folder(url_corregida, recursive=True, max_depth=2)
     current_hash = hashlib.md5(json.dumps(current_items, sort_keys=True).encode()).hexdigest()
     
     try:
@@ -307,14 +360,12 @@ def check_for_changes(url: str, state_file: str) -> Dict:
     if current_hash == saved_hash:
         return {'changed': False, 'new_items': [], 'removed_items': [], 'total_items': len(current_items)}
     
-    # Encontrar nuevos y eliminados
     current_urls = {item['url'] for item in current_items}
     saved_urls = {item['url'] for item in saved_items}
     
     new_items = [item for item in current_items if item['url'] not in saved_urls]
     removed_items = [item for item in saved_items if item['url'] not in current_urls]
     
-    # Guardar nuevo estado
     with open(state_file, 'w') as f:
         json.dump({
             'hash': current_hash,
@@ -343,70 +394,30 @@ def monitorear_y_notificar(chat_id: Optional[int] = None) -> Dict:
             enviar_mensaje(chat_id, f"✅ *Sin cambios detectados*\n\n📊 Total de archivos monitoreados: {resultado.get('total_items', 0)}")
         return resultado
     
-    # Hay cambios
     if chat_id:
         mensaje = f"📢 *CAMBIOS DETECTADOS en visuales.uclv.cu*\n🕐 {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n\n"
         
         nuevos = resultado['new_items']
-        eliminados = resultado['removed_items']
-        
-        # Agrupar por tipo
-        tipos_nuevos = {}
-        for item in nuevos:
-            tipo = item['type']
-            tipos_nuevos[tipo] = tipos_nuevos.get(tipo, 0) + 1
         
         if nuevos:
             mensaje += f"🆕 *Nuevos archivos ({len(nuevos)}):*\n"
-            for tipo, count in tipos_nuevos.items():
-                icono = {'video': '🎬', 'subtitle': '📝', 'image': '🖼️', 'info': '📄'}.get(tipo, '📄')
-                mensaje += f"  {icono} {tipo}: {count}\n"
-            mensaje += "\n"
+            for item in nuevos[:10]:
+                icono = {'video': '🎬', 'subtitle': '📝', 'image': '🖼️', 'info': '📄'}.get(item['type'], '📄')
+                mensaje += f"  {icono} `{item['name'][:50]}`\n"
+            if len(nuevos) > 10:
+                mensaje += f"  ... y {len(nuevos) - 10} más\n"
         
-        if eliminados:
-            mensaje += f"🗑️ *Eliminados ({len(eliminados)}):*\n"
-            for item in eliminados[:10]:
-                mensaje += f"  • `{item['name'][:50]}`\n"
-            if len(eliminados) > 10:
-                mensaje += f"  ... y {len(eliminados) - 10} más\n"
-        
-        mensaje += f"\n💡 Usa `/descargar <url>` para descargar archivos"
+        mensaje += f"\n💡 Usa `/descargar <url_de_carpeta>` para explorar y descargar archivos"
         enviar_mensaje(chat_id, mensaje)
     
     return resultado
 
 # ========== FUNCIONES DE DESCARGA ==========
-def es_carpeta(url: str) -> bool:
-    """Detecta si una URL apunta a una carpeta"""
-    # Termina con /
-    if url.endswith('/'):
-        return True
-    
-    # No tiene extensión de archivo
-    partes = url.split('/')
-    ultimo = partes[-1]
-    if '.' not in ultimo:
-        return True
-    
-    # Tiene extensión pero es de carpeta común
-    if ultimo in ['index.html', 'default.html', 'index.php']:
-        return True
-    
-    return False
-
 def descargar_archivo(url: str, destino: str, chat_id: Optional[int] = None,
                       progress_callback: Optional[Callable] = None,
                       max_retries: int = 3) -> Tuple[str, int]:
     """Descarga un archivo con reintentos y callback de progreso"""
-    url_limpia = url.strip()
-    
-    # Seguir redirecciones si es necesario
-    try:
-        response_head = requests.head(url_limpia, allow_redirects=True, timeout=10)
-        if response_head.status_code == 200:
-            url_limpia = response_head.url
-    except:
-        pass
+    url_limpia = corregir_url_archivo(url.strip())
     
     # Extraer nombre del archivo
     nombre = os.path.basename(urllib.parse.unquote(url_limpia.split('?')[0]))
@@ -426,10 +437,14 @@ def descargar_archivo(url: str, destino: str, chat_id: Optional[int] = None,
             
             total_size = int(response.headers.get('content-length', 0))
             
-            # Verificar que no es HTML
             content_type = response.headers.get('content-type', '')
             if 'text/html' in content_type and total_size < 102400:
-                raise Exception("La URL devolvió HTML (posiblemente no es un archivo directo)")
+                # Si es HTML, intentar con la URL alternativa
+                if 'visuales' in url_limpia:
+                    url_alternativa = url_limpia.replace('visuales.uclv.cu', 'oops.uclv.edu.cu')
+                    logger.info(f"Reintentando con URL alternativa: {url_alternativa}")
+                    return descargar_archivo(url_alternativa, destino, chat_id, progress_callback, max_retries)
+                raise Exception("La URL devolvió HTML. Usa la URL de la carpeta (terminada en /) para listar los archivos disponibles.")
             
             downloaded = 0
             with open(ruta, 'wb') as f:
@@ -442,7 +457,7 @@ def descargar_archivo(url: str, destino: str, chat_id: Optional[int] = None,
             return ruta, total_size
             
         except Exception as e:
-            logger.error(f"Intento {intento + 1} fallido para {url_limpia}: {e}")
+            logger.error(f"Intento {intento + 1} fallido: {e}")
             if intento == max_retries - 1:
                 raise e
             time.sleep(3)
@@ -474,14 +489,16 @@ def limpiar_temporales():
 def procesar_descarga(chat_id: int, url: str):
     """Procesa una solicitud de descarga - detecta si es carpeta o archivo"""
     
+    url = url.strip()
+    
     # Detectar si es una carpeta
     if es_carpeta(url):
         listar_archivos_carpeta(chat_id, url)
         return
     
-    # Es un archivo, proceder con descarga normal
+    # Es un archivo, proceder con descarga
     try:
-        enviar_mensaje(chat_id, f"🔄 *Procesando descarga...*")
+        enviar_mensaje(chat_id, f"🔄 *Descargando archivo...*")
         
         def progreso(downloaded, total, filename):
             if total > 0:
@@ -492,7 +509,7 @@ def procesar_descarga(chat_id: int, url: str):
         archivo, tamaño = descargar_archivo(url, DESCARGAS_DIR, chat_id, progreso)
         
         if tamaño < 10240:
-            enviar_mensaje(chat_id, f"❌ Error: Archivo muy pequeño ({FileUtils.format_file_size(tamaño)})\nLa URL puede ser incorrecta.")
+            enviar_mensaje(chat_id, f"❌ Error: Archivo muy pequeño ({FileUtils.format_file_size(tamaño)})\n\n💡 Sugerencia: Usa una URL de carpeta (terminada en /) para listar los archivos disponibles.")
             return
         
         if tamaño <= LIMITE_2GB:
@@ -511,7 +528,7 @@ def procesar_descarga(chat_id: int, url: str):
         
     except Exception as e:
         logger.error(f"Error en descarga: {e}")
-        enviar_mensaje(chat_id, f"❌ *Error:* `{str(e)[:200]}`")
+        enviar_mensaje(chat_id, f"❌ *Error:* `{str(e)[:200]}`\n\n💡 *Sugerencia:*\nUsa una URL de carpeta (terminada en /) para ver los archivos disponibles:\n`/descargar https://visuales.uclv.cu/Peliculas/Extranjeras/2026/War%20Machine%202026/`")
     finally:
         limpiar_temporales()
 
@@ -554,13 +571,10 @@ def webhook():
             
             logger.info(f"Callback recibido: {data}")
             
-            # Verificar si es un callback de descarga
             if data in temp_urls:
                 url_descarga = temp_urls[data]
-                responder_callback(callback_id, f"🔄 Descargando...")
-                # Limpiar el callback usado
+                responder_callback(callback_id, f"🔄 Descargando archivo...")
                 del temp_urls[data]
-                # Iniciar descarga en segundo plano
                 thread = threading.Thread(target=procesar_descarga, args=(chat_id, url_descarga))
                 thread.start()
             else:
@@ -585,32 +599,36 @@ def webhook():
                     "🤖 *Bot de Visuales UCLV*\n\n"
                     "✅ Bot funcionando\n\n"
                     "📌 *Instrucciones:*\n"
-                    "• Para descargar un archivo: `/descargar <url>`\n"
-                    "• Para explorar una carpeta: `/descargar <url_de_carpeta>`\n"
-                    "• Para escanear toda la web: `/monitorear`\n\n"
-                    "📌 *Ejemplos:*\n"
-                    "`/descargar https://oops.uclv.edu.cu/video.mp4`\n"
-                    "`/descargar https://visuales.uclv.cu/Peliculas/`\n\n"
+                    "• Para **explorar una carpeta** y ver sus archivos:\n"
+                    "  `/descargar <url_de_carpeta>`\n"
+                    "• Para **descargar un archivo** (después de explorar):\n"
+                    "  Usa los botones que aparecen\n\n"
+                    "📌 *Ejemplo:*\n"
+                    "`/descargar https://visuales.uclv.cu/Peliculas/Extranjeras/2026/War%20Machine%202026/`\n\n"
                     "Usa los botones de abajo:",
                     comandos)
             
             elif text == '📥 Descargar' or text.startswith('/descargar'):
                 if text == '📥 Descargar':
-                    enviar_mensaje(chat_id, "📥 *Descargar archivo o carpeta*\n\n"
-                                         "Para un *archivo*:\n`/descargar <url_del_archivo>`\n\n"
-                                         "Para explorar una *carpeta*:\n`/descargar <url_de_la_carpeta>`\n\n"
-                                         "📌 *Ejemplo con carpeta:*\n"
-                                         "`/descargar https://visuales.uclv.cu/Peliculas/`")
+                    enviar_mensaje(chat_id, "📥 *Explorar carpeta o descargar archivo*\n\n"
+                                         "**Para explorar una carpeta:**\n"
+                                         "`/descargar https://visuales.uclv.cu/ruta/de/la/carpeta/`\n\n"
+                                         "**Ejemplo real:**\n"
+                                         "`/descargar https://visuales.uclv.cu/Peliculas/Extranjeras/2026/War%20Machine%202026/`\n\n"
+                                         "⚠️ *Importante:* La URL debe terminar en `/` para explorar carpetas.\n\n"
+                                         "El bot listará los archivos y te dará botones para descargarlos.")
                 else:
                     partes = text.split(maxsplit=1)
                     if len(partes) == 2:
-                        thread = threading.Thread(target=procesar_descarga, args=(chat_id, partes[1]))
+                        url_comando = partes[1]
+                        thread = threading.Thread(target=procesar_descarga, args=(chat_id, url_comando))
                         thread.start()
                         enviar_mensaje(chat_id, "🔄 *Procesando solicitud...*")
                     else:
-                        enviar_mensaje(chat_id, "❌ Uso: `/descargar <url>`\n\n"
-                                              "Para un archivo: `/descargar https://.../video.mp4`\n"
-                                              "Para una carpeta: `/descargar https://.../carpeta/`")
+                        enviar_mensaje(chat_id, "❌ *Uso correcto:*\n"
+                                              "`/descargar <url_de_carpeta>`\n\n"
+                                              "Ejemplo:\n"
+                                              "`/descargar https://visuales.uclv.cu/Peliculas/Extranjeras/2026/War%20Machine%202026/`")
             
             elif text == '🔍 Monitorear' or text == '/monitorear':
                 thread = threading.Thread(target=monitorear_y_notificar, args=(chat_id,))
@@ -653,27 +671,25 @@ def webhook():
             elif text == '❓ Ayuda' or text == '/ayuda':
                 enviar_mensaje(chat_id,
                     "📖 *Ayuda del Bot*\n\n"
-                    "🔹 **Comandos principales:**\n"
-                    "`/descargar <url>` - Descarga un archivo O explora una carpeta\n"
-                    "`/monitorear` - Escanea toda la web por cambios\n"
-                    "`/estado` - Ver estado del bot\n"
-                    "`/limpiar` - Limpia archivos temporales\n"
-                    "`/ayuda` - Esta ayuda\n\n"
-                    "🔹 **Cómo usar `/descargar`:**\n"
-                    "• **Para un archivo:** `/descargar https://oops.uclv.edu.cu/.../video.mp4`\n"
-                    "• **Para una carpeta:** `/descargar https://visuales.uclv.cu/Carpeta/`\n\n"
-                    "🔹 **Cuando envías una carpeta:**\n"
-                    "• El bot listará todos los archivos dentro\n"
-                    "• Aparecerán botones para descargar directamente\n\n"
-                    "⚙️ *Comportamiento:*\n"
-                    "• Archivos <2GB → envío directo\n"
-                    "• Archivos >2GB → divididos en partes de 1.9GB\n"
-                    "• Carpetas → se listan los contenidos")
+                    "🔹 **Comando principal:**\n"
+                    "`/descargar <url_de_carpeta>` - Explora una carpeta y lista sus archivos\n\n"
+                    "🔹 **Ejemplo completo:**\n"
+                    "1. Explora la carpeta:\n"
+                    "   `/descargar https://visuales.uclv.cu/Peliculas/Extranjeras/2026/War%20Machine%202026/`\n"
+                    "2. El bot mostrará los archivos disponibles\n"
+                    "3. Usa los botones para descargar\n\n"
+                    "🔹 **Otros comandos:**\n"
+                    "• `/monitorear` - Escanea toda la web por cambios\n"
+                    "• `/estado` - Ver estado del bot\n"
+                    "• `/limpiar` - Limpia archivos temporales\n"
+                    "• `/ayuda` - Esta ayuda\n\n"
+                    "⚠️ *Importante:* Las URLs para explorar deben terminar en `/`")
             
             else:
-                enviar_mensaje(chat_id, f"❌ *Comando no reconocido:* `{text[:30]}`\n"
-                                      f"Usa `/ayuda` para ver los comandos disponibles\n\n"
-                                      f"💡 Tip: Prueba `/descargar https://visuales.uclv.cu/Peliculas/`")
+                enviar_mensaje(chat_id, f"❌ *Comando no reconocido:* `{text[:30]}`\n\n"
+                                      f"💡 **Prueba esto:**\n"
+                                      f"`/descargar https://visuales.uclv.cu/Peliculas/Extranjeras/2026/War%20Machine%202026/`\n\n"
+                                      f"Usa `/ayuda` para más información.")
         
         return jsonify({"status": "ok"})
     
@@ -689,5 +705,8 @@ if __name__ == "__main__":
     set_webhook()
     
     logger.info(f"Bot iniciado en puerto {port}")
-    logger.info("Características: detección automática de carpetas, listado de archivos, botones interactivos")
+    logger.info("Características:")
+    logger.info("  - Detección automática de carpetas")
+    logger.info("  - Listado de archivos con botones")
+    logger.info("  - Corrección automática de URLs")
     app.run(host='0.0.0.0', port=port)
