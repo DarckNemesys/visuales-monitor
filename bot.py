@@ -14,7 +14,14 @@ from flask import Flask, request, jsonify
 
 # ========== CONFIGURACIÓN ==========
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")  # Para envíos automáticos del monitor
+if not TELEGRAM_TOKEN:
+    raise Exception("TELEGRAM_TOKEN no configurado")
+
+# URL del webhook (se configura automáticamente)
+WEBHOOK_URL = os.environ.get("RENDER_EXTERNAL_URL", os.environ.get("WEBHOOK_URL"))
+if not WEBHOOK_URL:
+    WEBHOOK_URL = "https://visuales-bot.onrender.com"  # Cambia por tu URL real
+
 URL_BASE = os.environ.get("URL_BASE", "https://oops.uclv.edu.cu/")
 LIMITE_2GB = 2 * 1024 * 1024 * 1024
 TAMANO_PARTE_MB = 1900
@@ -24,7 +31,6 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DESCARGAS_DIR = os.path.join(BASE_DIR, "descargas")
 COMPRIMIDOS_DIR = os.path.join(BASE_DIR, "comprimidos")
 PARTES_DIR = os.path.join(BASE_DIR, "partes")
-ESTADO_FILE = os.path.join(BASE_DIR, "estado_visuales.json")
 
 for d in [DESCARGAS_DIR, COMPRIMIDOS_DIR, PARTES_DIR]:
     os.makedirs(d, exist_ok=True)
@@ -58,42 +64,37 @@ def enviar_documento(chat_id, archivo_path, caption=""):
         logger.error(f"Error enviando documento: {e}")
         return False
 
-def obtener_actualizaciones(offset=None):
-    """Obtiene actualizaciones de Telegram (polling)"""
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
-    params = {"timeout": 30}
-    if offset:
-        params["offset"] = offset
+def set_webhook():
+    """Configura el webhook en Telegram"""
+    webhook_url = f"{WEBHOOK_URL}/webhook"
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook?url={webhook_url}"
     try:
-        response = requests.get(url, params=params, timeout=35)
-        return response.json().get("result", [])
+        response = requests.get(url, timeout=10)
+        result = response.json()
+        if result.get('ok'):
+            logger.info(f"Webhook configurado correctamente: {webhook_url}")
+        else:
+            logger.error(f"Error configurando webhook: {result}")
+        return result
     except Exception as e:
-        logger.error(f"Error obteniendo updates: {e}")
-        return []
+        logger.error(f"Error en setWebhook: {e}")
+        return None
 
 # ========== FUNCIONES DE DESCARGA ==========
 def descargar_archivo(url, destino):
-    """Descarga un archivo desde URL con barra de progreso"""
+    """Descarga un archivo desde URL"""
     nombre = os.path.basename(url)
     if not nombre or '.' not in nombre:
         nombre = f"descarga_{int(time.time())}"
     ruta = os.path.join(destino, nombre)
     
-    logger.info(f"Descargando {url} -> {ruta}")
+    logger.info(f"Descargando {url}")
     response = requests.get(url, stream=True, timeout=60)
     response.raise_for_status()
-    
-    total = int(response.headers.get('content-length', 0))
-    descargado = 0
     
     with open(ruta, 'wb') as f:
         for chunk in response.iter_content(chunk_size=8192):
             f.write(chunk)
-            descargado += len(chunk)
-            if total > 0:
-                percent = (descargado / total) * 100
-                if int(percent) % 10 == 0:
-                    logger.info(f"Progreso: {percent:.1f}%")
     return ruta
 
 def dividir_archivo(archivo_path):
@@ -102,7 +103,7 @@ def dividir_archivo(archivo_path):
     base = os.path.basename(archivo_path)
     patron = os.path.join(PARTES_DIR, f"{base}.part")
     
-    logger.info(f"Dividiendo {archivo_path} en partes de {TAMANO_PARTE_MB}MB")
+    logger.info(f"Dividiendo {archivo_path}")
     subprocess.run(f"split -b {parte_size} '{archivo_path}' '{patron}'", shell=True, check=True)
     
     partes = sorted([os.path.join(PARTES_DIR, f) for f in os.listdir(PARTES_DIR) 
@@ -119,7 +120,6 @@ def limpiar_temporales():
                 pass
     logger.info("Archivos temporales limpiados")
 
-# ========== PROCESAMIENTO DE DESCARGA ==========
 def procesar_descarga(chat_id, url):
     """Procesa una solicitud de descarga"""
     try:
@@ -137,7 +137,7 @@ def procesar_descarga(chat_id, url):
             else:
                 enviar_mensaje(chat_id, "❌ Error al subir el archivo")
         else:
-            enviar_mensaje(chat_id, f"✂️ Archivo de {tamaño/(1024**3):.2f}GB, dividiendo en partes...")
+            enviar_mensaje(chat_id, f"✂️ Archivo de {tamaño/(1024**3):.2f}GB, dividiendo...")
             partes = dividir_archivo(archivo)
             for i, parte in enumerate(partes, 1):
                 enviar_mensaje(chat_id, f"📤 Subiendo parte {i}/{len(partes)}")
@@ -150,128 +150,96 @@ def procesar_descarga(chat_id, url):
     finally:
         limpiar_temporales()
 
-# ========== COMANDOS ==========
-def procesar_comando(chat_id, text):
-    """Procesa los comandos del bot"""
-    text = text.strip()
-    
-    if text == '/start':
-        enviar_mensaje(chat_id, 
-            "🤖 *Bot de Visuales UCLV*\n\n"
-            "📌 *Comandos disponibles:*\n"
-            "`/descargar <url>` - Descargar archivo\n"
-            "`/monitorear` - Ver último estado de la web\n"
-            "`/limpiar` - Limpiar archivos temporales\n"
-            "`/estado` - Ver estado del bot\n"
-            "`/ayuda` - Mostrar esta ayuda\n\n"
-            "💡 *Ejemplo:*\n"
-            "`/descargar https://oops.uclv.edu.cu/video.mp4`")
-    
-    elif text.startswith('/descargar'):
-        parts = text.split(maxsplit=1)
-        if len(parts) == 2:
-            thread = threading.Thread(target=procesar_descarga, args=(chat_id, parts[1]))
-            thread.start()
-            enviar_mensaje(chat_id, "🔄 *Descarga iniciada en segundo plano...*")
-        else:
-            enviar_mensaje(chat_id, "❌ *Uso:* `/descargar <url>`")
-    
-    elif text == '/estado':
-        # Calcular espacio usado
-        uso = 0
-        archivos = 0
-        for dir_path in [DESCARGAS_DIR, COMPRIMIDOS_DIR, PARTES_DIR]:
-            for f in os.listdir(dir_path):
-                fp = os.path.join(dir_path, f)
-                if os.path.isfile(fp):
-                    uso += os.path.getsize(fp)
-                    archivos += 1
-        enviar_mensaje(chat_id,
-            f"📊 *Estado del bot*\n\n"
-            f"✅ Activo\n"
-            f"💾 Espacio usado: {uso/(1024**3):.2f} GB\n"
-            f"📁 Archivos temporales: {archivos}\n"
-            f"📦 Límite sin dividir: 2GB\n"
-            f"✂️ Tamaño de parte: {TAMANO_PARTE_MB}MB")
-    
-    elif text == '/limpiar':
-        limpiar_temporales()
-        enviar_mensaje(chat_id, "🧹 *Archivos temporales limpiados*")
-    
-    elif text == '/monitorear':
-        enviar_mensaje(chat_id, "📢 *Monitoreo de visuales.uclv.cu*\n\nEjecutando escaneo...")
-        # Aquí puedes añadir la función de monitoreo
-        enviar_mensaje(chat_id, "🔍 Función en desarrollo. Próximamente.")
-    
-    elif text == '/ayuda':
-        enviar_mensaje(chat_id,
-            "📖 *Ayuda del Bot*\n\n"
-            "🔹 `/descargar <url>` - Descarga un archivo desde la URL\n"
-            "🔹 `/monitorear` - Escanea visuales.uclv.cu en busca de novedades\n"
-            "🔹 `/limpiar` - Limpia archivos temporales del servidor\n"
-            "🔹 `/estado` - Muestra el estado del bot\n"
-            "🔹 `/ayuda` - Muestra esta ayuda\n\n"
-            "⚙️ *Comportamiento:*\n"
-            "• Archivos <2GB → envío directo\n"
-            "• Archivos >2GB → divididos en partes de 1.9GB\n\n"
-            "📌 *Ejemplo:*\n"
-            "`/descargar https://oops.uclv.edu.cu/video.mp4`")
-    
-    else:
-        enviar_mensaje(chat_id, "❌ *Comando no reconocido.*\nUsa `/ayuda` para ver los comandos disponibles.")
-
-# ========== POLLING ==========
-def polling_loop():
-    """Bucle principal de polling para recibir mensajes"""
-    last_update_id = 0
-    logger.info("Iniciando polling...")
-    
-    while True:
-        try:
-            updates = obtener_actualizaciones(last_update_id + 1 if last_update_id else None)
-            
-            for update in updates:
-                if 'message' in update:
-                    msg = update['message']
-                    chat_id = msg['chat']['id']
-                    text = msg.get('text', '')
-                    
-                    if text:
-                        logger.info(f"Mensaje de {chat_id}: {text[:50]}")
-                        procesar_comando(chat_id, text)
-                
-                last_update_id = update.get('update_id', last_update_id)
-            
-            time.sleep(1)
-            
-        except Exception as e:
-            logger.error(f"Error en polling: {e}")
-            time.sleep(5)
-
-# ========== SERVIDOR FLASK (para mantener vivo el servicio) ==========
+# ========== SERVIDOR FLASK ==========
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return {"status": "Bot activo", "version": "1.0", "comandos": ["/start", "/descargar", "/estado", "/limpiar", "/monitorear", "/ayuda"]}
+    return {"status": "Bot activo", "version": "1.0"}
 
 @app.route('/health')
 def health():
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
-@app.route('/ping')
-def ping():
-    return "pong"
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """Recibe mensajes de Telegram"""
+    try:
+        update = request.get_json()
+        logger.info(f"Webhook recibido: {update}")
+        
+        if 'message' in update:
+            msg = update['message']
+            chat_id = msg['chat']['id']
+            text = msg.get('text', '')
+            
+            if not text:
+                return jsonify({"status": "ok"})
+            
+            text = text.strip()
+            logger.info(f"Comando recibido de {chat_id}: {text}")
+            
+            # Comandos
+            if text == '/start':
+                enviar_mensaje(chat_id, 
+                    "🤖 *Bot de Visuales UCLV*\n\n"
+                    "📌 *Comandos:*\n"
+                    "`/descargar <url>` - Descargar archivo\n"
+                    "`/estado` - Ver estado\n"
+                    "`/limpiar` - Limpiar temporales\n"
+                    "`/ayuda` - Ayuda\n\n"
+                    "💡 *Ejemplo:*\n"
+                    "`/descargar https://oops.uclv.edu.cu/video.mp4`")
+            
+            elif text.startswith('/descargar'):
+                parts = text.split(maxsplit=1)
+                if len(parts) == 2:
+                    thread = threading.Thread(target=procesar_descarga, args=(chat_id, parts[1]))
+                    thread.start()
+                    enviar_mensaje(chat_id, "🔄 *Descarga iniciada en segundo plano...*")
+                else:
+                    enviar_mensaje(chat_id, "❌ *Uso:* `/descargar <url>`")
+            
+            elif text == '/estado':
+                uso = 0
+                archivos = 0
+                for dir_path in [DESCARGAS_DIR, COMPRIMIDOS_DIR, PARTES_DIR]:
+                    for f in os.listdir(dir_path):
+                        fp = os.path.join(dir_path, f)
+                        if os.path.isfile(fp):
+                            uso += os.path.getsize(fp)
+                            archivos += 1
+                enviar_mensaje(chat_id,
+                    f"📊 *Estado*\n\n✅ Activo\n💾 Espacio: {uso/(1024**3):.2f} GB\n📁 Archivos: {archivos}")
+            
+            elif text == '/limpiar':
+                limpiar_temporales()
+                enviar_mensaje(chat_id, "🧹 *Archivos temporales limpiados*")
+            
+            elif text == '/ayuda':
+                enviar_mensaje(chat_id,
+                    "📖 *Ayuda*\n\n"
+                    "`/descargar <url>` - Descargar archivo\n"
+                    "`/estado` - Ver estado\n"
+                    "`/limpiar` - Limpiar temporales\n\n"
+                    "⚙️ Archivos <2GB: envío directo\n"
+                    "✂️ Archivos >2GB: partes de 1.9GB")
+            
+            else:
+                enviar_mensaje(chat_id, "❌ Comando no reconocido. Usa `/ayuda`")
+        
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        logger.error(f"Error en webhook: {e}")
+        return jsonify({"status": "error"}), 500
 
 # ========== MAIN ==========
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     
-    # Iniciar polling en hilo separado
-    polling_thread = threading.Thread(target=polling_loop, daemon=True)
-    polling_thread.start()
-    logger.info("Polling iniciado en segundo plano")
+    # Configurar webhook
+    time.sleep(2)
+    set_webhook()
     
-    # Iniciar servidor Flask
-    logger.info(f"Iniciando servidor web en puerto {port}")
+    logger.info(f"Iniciando servidor en puerto {port}")
     app.run(host='0.0.0.0', port=port)
