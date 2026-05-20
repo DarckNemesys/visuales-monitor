@@ -136,13 +136,15 @@ def descargar_archivo(url, destino, chat_id=None):
         downloaded = 0
         
         with open(ruta, 'wb') as f:
+            last_percent = 0
             for chunk in response.iter_content(chunk_size=32768):
                 f.write(chunk)
                 downloaded += len(chunk)
                 if chat_id and total_size > 0:
-                    percent = (downloaded / total_size) * 100
-                    if int(percent) % 20 == 0:
-                        enviar_mensaje(chat_id, f"📥 Progreso: {percent:.0f}% ({formatear_tamaño(downloaded)})")
+                    percent = int((downloaded / total_size) * 100)
+                    if percent > 0 and percent % 25 == 0 and percent != last_percent:
+                        enviar_mensaje(chat_id, f"Progreso: {percent}% ({formatear_tamaño(downloaded)})")
+                        last_percent = percent
         
         return ruta, total_size
     
@@ -153,12 +155,13 @@ def descargar_archivo(url, destino, chat_id=None):
 def dividir_archivo(archivo_path):
     parte_size = TAMANO_PARTE_MB * 1024 * 1024
     base = os.path.basename(archivo_path)
-    patron = os.path.join(PARTES_DIR, f"{base}.part")
+    timestamp = int(time.time())
+    patron = os.path.join(PARTES_DIR, f"{base}_{timestamp}.part")
     
-    subprocess.run(f"split -b {parte_size} '{archivo_path}' '{patron}'", shell=True, check=True)
+    subprocess.run(['split', '-b', str(parte_size), '-d', archivo_path, patron + '_'], check=True)
     
     partes = sorted([os.path.join(PARTES_DIR, f) for f in os.listdir(PARTES_DIR) 
-                     if f.startswith(base + ".part")])
+                     if f.startswith(f"{base}_{timestamp}.part_")])
     return partes
 
 def limpiar_temporales():
@@ -176,7 +179,7 @@ def procesar_descarga(chat_id, url):
         
         archivo, tamaño = descargar_archivo(url, DESCARGAS_DIR, chat_id)
         
-        if tamaño < 10240:
+        if tamaño < 1024:
             enviar_mensaje(chat_id, f"❌ Error: Archivo muy pequeño ({formatear_tamaño(tamaño)})")
             return
         
@@ -196,7 +199,8 @@ def procesar_descarga(chat_id, url):
         # REFLEJAR EN EL CANAL (si está configurado)
         if CANAL_ID:
             nombre_archivo = os.path.basename(archivo)
-            mensaje_canal = f"📁 *Nuevo archivo reflejado*\n\n📄 `{nombre_archivo}`\n💾 {formatear_tamaño(tamaño)}\n🔗 Fuente: `{url[:80]}...`"
+            url_preview = url[:80] + "..." if len(url) > 80 else url
+            mensaje_canal = f"📁 *Nuevo archivo reflejado*\n\n📄 `{nombre_archivo}`\n💾 {formatear_tamaño(tamaño)}\n🔗 Fuente: `{url_preview}`"
             
             if tamaño <= LIMITE_2GB:
                 enviar_documento(CANAL_ID, archivo, mensaje_canal)
@@ -251,7 +255,7 @@ def webhook():
             chat_id = msg['chat']['id']
             text = msg.get('text', '').strip()
             
-            if not text:
+            if not text or not text.strip():
                 return jsonify({"status": "ok"})
             
             logger.info(f"Comando: {text[:50]} de {chat_id}")

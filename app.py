@@ -32,7 +32,7 @@ def enviar_mensaje(mensaje):
 def monitorear():
     print("Ejecutando monitoreo...")
     try:
-        r = requests.get("https://visuales.uclv.cu/", timeout=30)
+        r = requests.get(URL_BASE, timeout=30)
         soup = BeautifulSoup(r.text, 'html.parser')
         items = []
         for a in soup.find_all('a'):
