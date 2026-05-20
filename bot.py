@@ -5,7 +5,6 @@ import os
 import time
 import json
 import hashlib
-import zipfile
 import logging
 import subprocess
 import requests
@@ -51,6 +50,46 @@ def enviar_mensaje(chat_id, texto):
         logger.error(f"Error enviando mensaje: {e}")
         return False
 
+def enviar_mensaje_con_botones(chat_id, texto, botones):
+    """Envía un mensaje con botones inline"""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    
+    # Crear teclado con botones
+    keyboard = [[{"text": texto_boton, "callback_data": callback}] for texto_boton, callback in botones]
+    
+    payload = {
+        "chat_id": chat_id,
+        "text": texto,
+        "parse_mode": "Markdown",
+        "reply_markup": {"inline_keyboard": keyboard}
+    }
+    try:
+        response = requests.post(url, json=payload, timeout=10)
+        return response.ok
+    except Exception as e:
+        logger.error(f"Error enviando mensaje con botones: {e}")
+        return False
+
+def enviar_mensaje_con_teclado(chat_id, texto, comandos):
+    """Envía un mensaje con teclado personalizado (comandos visibles)"""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    
+    # Crear teclado con comandos
+    keyboard = [[{"text": cmd}] for cmd in comandos]
+    
+    payload = {
+        "chat_id": chat_id,
+        "text": texto,
+        "parse_mode": "Markdown",
+        "reply_markup": {"keyboard": keyboard, "resize_keyboard": True, "one_time_keyboard": False}
+    }
+    try:
+        response = requests.post(url, json=payload, timeout=10)
+        return response.ok
+    except Exception as e:
+        logger.error(f"Error enviando teclado: {e}")
+        return False
+
 def enviar_documento(chat_id, archivo_path, caption=""):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
     try:
@@ -77,6 +116,17 @@ def set_webhook():
     except Exception as e:
         logger.error(f"Error en setWebhook: {e}")
         return None
+
+def responder_callback(callback_id, texto):
+    """Responde a un callback de botón"""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery"
+    try:
+        payload = {"callback_query_id": callback_id, "text": texto, "show_alert": False}
+        response = requests.post(url, json=payload, timeout=10)
+        return response.ok
+    except Exception as e:
+        logger.error(f"Error respondiendo callback: {e}")
+        return False
 
 # ========== FUNCIONES DE MONITOREO ==========
 def obtener_contenido_web(url):
@@ -117,20 +167,13 @@ def cargar_estado():
         return None
 
 def monitorear_y_notificar(chat_id=None):
-    """Función de monitoreo. Si se provee chat_id, envía resultado al chat."""
     logger.info("Iniciando monitoreo...")
-    resultado = {
-        'cambios': False,
-        'nuevos': [],
-        'eliminados': [],
-        'mensaje': ''
-    }
+    resultado = {'cambios': False, 'nuevos': [], 'eliminados': [], 'mensaje': ''}
     
     html = obtener_contenido_web("https://visuales.uclv.cu/")
     if not html:
         html = obtener_contenido_web(URL_BASE)
     if not html:
-        logger.error("No se pudo obtener la web")
         if chat_id:
             enviar_mensaje(chat_id, "❌ *Error:* No se pudo conectar con visuales.uclv.cu")
         return resultado
@@ -142,7 +185,9 @@ def monitorear_y_notificar(chat_id=None):
     if not estado:
         guardar_estado(items, hash_actual)
         if chat_id:
-            enviar_mensaje(chat_id, f"📊 *Primer escaneo completado*\n\n📁 Total carpetas: {len([i for i in items if i['tipo'] == 'carpeta'])}\n📄 Total archivos: {len([i for i in items if i['tipo'] == 'archivo'])}")
+            total_carpetas = len([i for i in items if i['tipo'] == 'carpeta'])
+            total_archivos = len([i for i in items if i['tipo'] == 'archivo'])
+            enviar_mensaje(chat_id, f"📊 *Primer escaneo completado*\n\n📁 Carpetas: {total_carpetas}\n📄 Archivos: {total_archivos}")
         resultado['mensaje'] = "Estado inicial guardado"
         return resultado
     
@@ -152,7 +197,6 @@ def monitorear_y_notificar(chat_id=None):
         resultado['mensaje'] = "Sin cambios"
         return resultado
     
-    # Hay cambios
     urls_antiguas = {i['url'] for i in estado['items']}
     urls_actuales = {i['url'] for i in items}
     
@@ -164,7 +208,7 @@ def monitorear_y_notificar(chat_id=None):
     resultado['eliminados'] = eliminados
     
     if chat_id:
-        mensaje = f"📢 *CAMBIOS DETECTADOS* en visuales.uclv.cu\n🕐 {datetime.now().strftime('%d/%m/%Y %H:%M')}\n\n"
+        mensaje = f"📢 *CAMBIOS DETECTADOS*\n🕐 {datetime.now().strftime('%d/%m/%Y %H:%M')}\n\n"
         if nuevos:
             mensaje += f"🆕 *Nuevos ({len(nuevos)}):*\n"
             for item in nuevos[:10]:
@@ -264,6 +308,7 @@ def webhook():
         update = request.get_json()
         logger.info(f"Webhook recibido")
         
+        # Procesar mensajes de texto
         if 'message' in update:
             msg = update['message']
             chat_id = msg['chat']['id']
@@ -276,30 +321,33 @@ def webhook():
             
             # ========== COMANDOS ==========
             if text == '/start':
-                enviar_mensaje(chat_id, 
+                # Enviar teclado con botones
+                comandos = ["📥 Descargar", "🔍 Monitorear", "📊 Estado", "🧹 Limpiar", "❓ Ayuda"]
+                enviar_mensaje_con_teclado(chat_id, 
                     "🤖 *Bot de Visuales UCLV*\n\n"
-                    "📌 *Comandos:*\n"
-                    "`/descargar <url>` - Descargar archivo\n"
-                    "`/monitorear` - Escanear web manualmente\n"
-                    "`/estado` - Ver estado del bot\n"
-                    "`/limpiar` - Limpiar temporales\n"
-                    "`/ayuda` - Mostrar ayuda")
+                    "Usa los botones de abajo para interactuar.\n\n"
+                    "📌 *Comandos manuales:*\n"
+                    "`/descargar <url>`\n`/monitorear`\n`/estado`\n`/limpiar`\n`/ayuda`",
+                    comandos)
             
-            elif text.startswith('/descargar'):
-                partes = text.split(maxsplit=1)
-                if len(partes) == 2:
-                    thread = threading.Thread(target=procesar_descarga, args=(chat_id, partes[1]))
-                    thread.start()
-                    enviar_mensaje(chat_id, "🔄 *Descarga iniciada en segundo plano...*")
+            elif text == '📥 Descargar' or text.startswith('/descargar'):
+                if text == '📥 Descargar':
+                    enviar_mensaje(chat_id, "📥 *Descargar archivo*\n\nEnvía la URL del archivo:\n`/descargar https://...`")
                 else:
-                    enviar_mensaje(chat_id, "❌ *Uso:* `/descargar <url>`")
+                    partes = text.split(maxsplit=1)
+                    if len(partes) == 2:
+                        thread = threading.Thread(target=procesar_descarga, args=(chat_id, partes[1]))
+                        thread.start()
+                        enviar_mensaje(chat_id, "🔄 *Descarga iniciada en segundo plano...*")
+                    else:
+                        enviar_mensaje(chat_id, "❌ *Uso:* `/descargar <url>`")
             
-            elif text == '/monitorear':
+            elif text == '🔍 Monitorear' or text == '/monitorear':
                 enviar_mensaje(chat_id, "🔍 *Escaneando visuales.uclv.cu...*\nEsto puede tomar unos segundos.")
                 thread = threading.Thread(target=monitorear_y_notificar, args=(chat_id,))
                 thread.start()
             
-            elif text == '/estado':
+            elif text == '📊 Estado' or text == '/estado':
                 uso = 0
                 archivos = 0
                 for dir_path in [DESCARGAS_DIR, COMPRIMIDOS_DIR, PARTES_DIR]:
@@ -320,24 +368,65 @@ def webhook():
                     f"🔍 Último escaneo: {ultimo_escaneo[:16] if ultimo_escaneo != 'Nunca' else 'Nunca'}\n"
                     f"📦 Límite: 2GB (dividido en {TAMANO_PARTE_MB}MB)")
             
-            elif text == '/limpiar':
+            elif text == '🧹 Limpiar' or text == '/limpiar':
                 limpiar_temporales()
                 enviar_mensaje(chat_id, "🧹 *Archivos temporales limpiados*")
             
-            elif text == '/ayuda':
+            elif text == '❓ Ayuda' or text == '/ayuda':
                 enviar_mensaje(chat_id,
                     "📖 *Ayuda del Bot*\n\n"
-                    "🔹 `/descargar <url>` - Descarga un archivo\n"
-                    "🔹 `/monitorear` - Escanea la web por cambios\n"
-                    "🔹 `/estado` - Ver estado del bot\n"
-                    "🔹 `/limpiar` - Limpiar archivos temporales\n"
-                    "🔹 `/ayuda` - Mostrar ayuda\n\n"
+                    "🔹 **Botones disponibles:**\n"
+                    "• `📥 Descargar` - Descarga un archivo\n"
+                    "• `🔍 Monitorear` - Escanea la web\n"
+                    "• `📊 Estado` - Ver estado\n"
+                    "• `🧹 Limpiar` - Limpia temporales\n"
+                    "• `❓ Ayuda` - Esta ayuda\n\n"
+                    "🔹 **Comandos manuales:**\n"
+                    "`/descargar <url>`\n`/monitorear`\n`/estado`\n`/limpiar`\n`/ayuda`\n\n"
                     "⚙️ *Comportamiento:*\n"
                     "• Archivos <2GB → envío directo\n"
                     "• Archivos >2GB → divididos en partes de 1.9GB")
             
             else:
-                enviar_mensaje(chat_id, f"❌ *Comando no reconocido:* `{text}`\nUsa `/ayuda`")
+                enviar_mensaje(chat_id, f"❌ *Comando no reconocido:* `{text}`\nUsa `/ayuda` o los botones.")
+        
+        # Procesar callbacks de botones
+        elif 'callback_query' in update:
+            callback = update['callback_query']
+            callback_id = callback['id']
+            chat_id = callback['message']['chat']['id']
+            data = callback['data']
+            
+            logger.info(f"Callback: {data} de {chat_id}")
+            
+            if data == 'descargar':
+                responder_callback(callback_id, "Envía /descargar <url>")
+                enviar_mensaje(chat_id, "📥 Envía el comando:\n`/descargar <url>`")
+            elif data == 'monitorear':
+                responder_callback(callback_id, "Escaneando...")
+                thread = threading.Thread(target=monitorear_y_notificar, args=(chat_id,))
+                thread.start()
+            elif data == 'estado':
+                responder_callback(callback_id, "Obteniendo estado...")
+                # Procesar estado
+                uso = 0
+                archivos = 0
+                for dir_path in [DESCARGAS_DIR, COMPRIMIDOS_DIR, PARTES_DIR]:
+                    for f in os.listdir(dir_path):
+                        fp = os.path.join(dir_path, f)
+                        if os.path.isfile(fp):
+                            uso += os.path.getsize(fp)
+                            archivos += 1
+                estado = cargar_estado()
+                ultimo_escaneo = estado.get('timestamp', 'Nunca') if estado else 'Nunca'
+                enviar_mensaje(chat_id, f"📊 *Estado*\n💾 {uso/(1024**3):.2f} GB\n📁 {archivos} archivos\n🔍 Último escaneo: {ultimo_escaneo[:16] if ultimo_escaneo != 'Nunca' else 'Nunca'}")
+            elif data == 'limpiar':
+                responder_callback(callback_id, "Limpiando...")
+                limpiar_temporales()
+                enviar_mensaje(chat_id, "🧹 Limpiado")
+            elif data == 'ayuda':
+                responder_callback(callback_id, "Ayuda")
+                enviar_mensaje(chat_id, "📖 Usa /ayuda para ver todos los comandos")
         
         return jsonify({"status": "ok"})
     
