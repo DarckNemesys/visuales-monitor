@@ -11,6 +11,9 @@ import urllib.parse
 import threading
 from datetime import datetime
 from flask import Flask, request, jsonify
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ========== CONFIGURACIÓN ==========
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -22,7 +25,7 @@ if not WEBHOOK_URL:
     WEBHOOK_URL = "https://visuales-bot.onrender.com"
 
 # ID del canal donde se reflejará el contenido
-CANAL_ID = os.environ.get("CANAL_ID")  # Ej: -1001234567890
+CANAL_ID = os.environ.get("CANAL_ID") or os.environ.get("CHAT_ID")
 
 LIMITE_2GB = 2 * 1024 * 1024 * 1024
 TAMANO_PARTE_MB = 1900

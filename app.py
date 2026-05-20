@@ -8,6 +8,9 @@ from bs4 import BeautifulSoup
 import hashlib
 import json
 from datetime import datetime
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = Flask(__name__)
 
