@@ -17,12 +17,10 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 if not TELEGRAM_TOKEN:
     raise Exception("TELEGRAM_TOKEN no configurado")
 
-# URL del webhook (se configura automáticamente)
 WEBHOOK_URL = os.environ.get("RENDER_EXTERNAL_URL", os.environ.get("WEBHOOK_URL"))
 if not WEBHOOK_URL:
-    WEBHOOK_URL = "https://visuales-bot.onrender.com"  # Cambia por tu URL real
+    WEBHOOK_URL = "https://visuales-bot.onrender.com"
 
-URL_BASE = os.environ.get("URL_BASE", "https://oops.uclv.edu.cu/")
 LIMITE_2GB = 2 * 1024 * 1024 * 1024
 TAMANO_PARTE_MB = 1900
 
@@ -35,7 +33,6 @@ PARTES_DIR = os.path.join(BASE_DIR, "partes")
 for d in [DESCARGAS_DIR, COMPRIMIDOS_DIR, PARTES_DIR]:
     os.makedirs(d, exist_ok=True)
 
-# Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -46,6 +43,7 @@ def enviar_mensaje(chat_id, texto):
     try:
         payload = {"chat_id": chat_id, "text": texto, "parse_mode": "Markdown"}
         response = requests.post(url, json=payload, timeout=10)
+        logger.info(f"Mensaje enviado a {chat_id}: {response.status_code}")
         return response.ok
     except Exception as e:
         logger.error(f"Error enviando mensaje: {e}")
@@ -72,9 +70,9 @@ def set_webhook():
         response = requests.get(url, timeout=10)
         result = response.json()
         if result.get('ok'):
-            logger.info(f"Webhook configurado correctamente: {webhook_url}")
+            logger.info(f"Webhook configurado: {webhook_url}")
         else:
-            logger.error(f"Error configurando webhook: {result}")
+            logger.error(f"Error webhook: {result}")
         return result
     except Exception as e:
         logger.error(f"Error en setWebhook: {e}")
@@ -125,7 +123,6 @@ def procesar_descarga(chat_id, url):
     try:
         enviar_mensaje(chat_id, f"🔄 *Procesando:* `{url[:80]}...`")
         
-        # Descargar
         enviar_mensaje(chat_id, "📥 Descargando archivo...")
         archivo = descargar_archivo(url, DESCARGAS_DIR)
         tamaño = os.path.getsize(archivo)
@@ -142,7 +139,7 @@ def procesar_descarga(chat_id, url):
             for i, parte in enumerate(partes, 1):
                 enviar_mensaje(chat_id, f"📤 Subiendo parte {i}/{len(partes)}")
                 enviar_documento(chat_id, parte, f"📦 {os.path.basename(archivo)} - Parte {i}/{len(partes)}")
-            enviar_mensaje(chat_id, f"✅ *Descarga completada*\n\n📌 Para unir las partes:\n`cat {os.path.basename(archivo)}.part* > {os.path.basename(archivo)}`")
+            enviar_mensaje(chat_id, f"✅ *Descarga completada*")
         
     except Exception as e:
         logger.error(f"Error en descarga: {e}")
@@ -159,46 +156,49 @@ def home():
 
 @app.route('/health')
 def health():
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+    return {"status": "healthy"}
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    """Recibe mensajes de Telegram"""
+    """Recibe y procesa mensajes de Telegram"""
     try:
         update = request.get_json()
         logger.info(f"Webhook recibido: {update}")
         
+        # Procesar mensaje
         if 'message' in update:
             msg = update['message']
             chat_id = msg['chat']['id']
-            text = msg.get('text', '')
             
+            # Obtener texto del mensaje
+            text = msg.get('text', '')
             if not text:
                 return jsonify({"status": "ok"})
             
             text = text.strip()
-            logger.info(f"Comando recibido de {chat_id}: {text}")
+            logger.info(f"Comando: '{text}' de chat {chat_id}")
             
-            # Comandos
+            # ========== COMANDOS ==========
             if text == '/start':
                 enviar_mensaje(chat_id, 
                     "🤖 *Bot de Visuales UCLV*\n\n"
                     "📌 *Comandos:*\n"
                     "`/descargar <url>` - Descargar archivo\n"
-                    "`/estado` - Ver estado\n"
-                    "`/limpiar` - Limpiar temporales\n"
-                    "`/ayuda` - Ayuda\n\n"
+                    "`/estado` - Ver estado del bot\n"
+                    "`/limpiar` - Limpiar archivos temporales\n"
+                    "`/ayuda` - Mostrar ayuda\n\n"
                     "💡 *Ejemplo:*\n"
                     "`/descargar https://oops.uclv.edu.cu/video.mp4`")
             
             elif text.startswith('/descargar'):
-                parts = text.split(maxsplit=1)
-                if len(parts) == 2:
-                    thread = threading.Thread(target=procesar_descarga, args=(chat_id, parts[1]))
+                partes = text.split(maxsplit=1)
+                if len(partes) == 2:
+                    url = partes[1]
+                    enviar_mensaje(chat_id, f"🔄 *Descarga iniciada en segundo plano para:*\n`{url[:80]}`")
+                    thread = threading.Thread(target=procesar_descarga, args=(chat_id, url))
                     thread.start()
-                    enviar_mensaje(chat_id, "🔄 *Descarga iniciada en segundo plano...*")
                 else:
-                    enviar_mensaje(chat_id, "❌ *Uso:* `/descargar <url>`")
+                    enviar_mensaje(chat_id, "❌ *Uso correcto:* `/descargar <url>`")
             
             elif text == '/estado':
                 uso = 0
@@ -210,7 +210,12 @@ def webhook():
                             uso += os.path.getsize(fp)
                             archivos += 1
                 enviar_mensaje(chat_id,
-                    f"📊 *Estado*\n\n✅ Activo\n💾 Espacio: {uso/(1024**3):.2f} GB\n📁 Archivos: {archivos}")
+                    f"📊 *Estado del bot*\n\n"
+                    f"✅ Bot activo\n"
+                    f"💾 Espacio usado: {uso/(1024**3):.2f} GB\n"
+                    f"📁 Archivos temporales: {archivos}\n"
+                    f"📦 Límite sin dividir: 2GB\n"
+                    f"✂️ Tamaño de parte: {TAMANO_PARTE_MB}MB")
             
             elif text == '/limpiar':
                 limpiar_temporales()
@@ -218,20 +223,25 @@ def webhook():
             
             elif text == '/ayuda':
                 enviar_mensaje(chat_id,
-                    "📖 *Ayuda*\n\n"
-                    "`/descargar <url>` - Descargar archivo\n"
-                    "`/estado` - Ver estado\n"
-                    "`/limpiar` - Limpiar temporales\n\n"
-                    "⚙️ Archivos <2GB: envío directo\n"
-                    "✂️ Archivos >2GB: partes de 1.9GB")
+                    "📖 *Ayuda del Bot*\n\n"
+                    "🔹 `/descargar <url>` - Descarga un archivo\n"
+                    "🔹 `/estado` - Ver estado del bot\n"
+                    "🔹 `/limpiar` - Limpiar archivos temporales\n"
+                    "🔹 `/ayuda` - Mostrar esta ayuda\n\n"
+                    "⚙️ *Comportamiento:*\n"
+                    "• Archivos <2GB → envío directo\n"
+                    "• Archivos >2GB → divididos en partes de 1.9GB\n\n"
+                    "📌 *Ejemplo:*\n"
+                    "`/descargar https://oops.uclv.edu.cu/video.mp4`")
             
             else:
-                enviar_mensaje(chat_id, "❌ Comando no reconocido. Usa `/ayuda`")
+                enviar_mensaje(chat_id, f"❌ *Comando no reconocido:* `{text}`\nUsa `/ayuda` para ver los comandos disponibles.")
         
         return jsonify({"status": "ok"})
+    
     except Exception as e:
         logger.error(f"Error en webhook: {e}")
-        return jsonify({"status": "error"}), 500
+        return jsonify({"status": "error", "error": str(e)}), 500
 
 # ========== MAIN ==========
 if __name__ == "__main__":
@@ -241,5 +251,5 @@ if __name__ == "__main__":
     time.sleep(2)
     set_webhook()
     
-    logger.info(f"Iniciando servidor en puerto {port}")
+    logger.info(f"Bot iniciado en puerto {port}")
     app.run(host='0.0.0.0', port=port)
