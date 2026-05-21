@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+Monitor Recursivo de Visuales UCLV - Versión Estable
+"""
+
 from flask import Flask
 import threading
 import time
@@ -34,7 +38,7 @@ def enviar_alerta_telegram(mensaje: str):
     if not TELEGRAM_TOKEN or not CHAT_ID: return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try: requests.post(url, json={"chat_id": CHAT_ID, "text": mensaje, "parse_mode": "Markdown"}, timeout=15)
-    except Exception as e: print(f"Error: {e}")
+    except Exception as e: print(f"Error enviando alerta: {e}")
 
 def fetch_html_con_reintentos(url: str, retries: int = MAX_RETRIES) -> Optional[str]:
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Monitor/2.0'}
@@ -83,13 +87,13 @@ def ejecutar_monitoreo():
             mensaje = (
                 f"📢 *CAMBIOS DETECTADOS EN VISUALES UCLV*\n\n"
                 f"🌐 *Servidor:* {URL_BASE}\n"
-                f"📊 *Total URLs Indexadas:* {len(urls_encontradas)}\n"
-                f"➕ *Nuevas entradas:* {nuevas_entradas}\n"
+                f"📊 *Total Content:* {len(urls_encontradas)} URLs\n"
+                f"➕ *Nuevas entradas detectadas:* {nuevas_entradas}\n"
             )
             enviar_alerta_telegram(mensaje)
             with open(ESTADO_FILE, 'w') as f:
                 json.dump({'hash': hash_actual, 'timestamp': datetime.now().isoformat(), 'items_count': len(urls_encontradas)}, f, indent=2)
-    except Exception as e: print(f"Error: {e}")
+    except Exception as e: print(f"Error en monitor: {e}")
 
 def daemon_scheduler():
     while True:
