@@ -97,7 +97,7 @@ def enviar_documento(chat_id: int, archivo_path: str, caption: str) -> bool:
         with open(archivo_path, 'rb') as f:
             files = {'document': f}
             data = {'chat_id': chat_id, 'caption': caption, 'parse_mode': 'Markdown'}
-            r = requests.post(url, data=data, files=files, timeout=300) # Timeout extendido para subidas
+            r = requests.post(url, data=data, files=files, timeout=300)
             return r.status_code == 200
     except Exception as e:
         logger.error(f"Error enviando documento {archivo_path}: {e}")
@@ -145,15 +145,18 @@ def descargar_archivo_streaming(url: str, destino_path: str) -> bool:
         with requests.get(url, headers=headers, stream=True, timeout=60) as r:
             r.raise_for_status()
             with open(destino_path, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=65536): # Bloques estables de 64KB
+                for chunk in r.iter_content(chunk_size=65536):
                     if chunk:
                         f.write(chunk)
-                        f.flush() # Forzar volcado a disco inmediato
+                        f.flush()
         return True
     except Exception as e:
         logger.error(f"Fallo en descarga streaming de {url}: {e}")
         if os.path.exists(destino_path):
-            os.remove(destino_path)
+            try:
+                os.remove(destino_path)
+            except Exception:
+                pass
         return False
 
 def dividir_archivo_nativo(archivo_path: str, tamano_mb: int = TAMANO_PARTE_MB) -> List[str]:
@@ -185,7 +188,7 @@ def proceso_descarga_y_envio(chat_id: int, url_archivo: str, nombre_archivo: str
     
     enviar_mensaje(chat_id, f"📥 *Iniciando descarga al servidor:*\n`{nombre_archivo}`\n\n_Por favor, espera..._")
     
-    if not descargar_archivo_streaming(url_archivo, rta_local := ruta_local):
+    if not descargar_archivo_streaming(url_archivo, ruta_local):
         enviar_mensaje(chat_id, f"❌ Error al descargar `{nombre_archivo}` desde el servidor universitario.")
         return
 
@@ -211,7 +214,10 @@ def proceso_descarga_y_envio(chat_id: int, url_archivo: str, nombre_archivo: str
             for i, parte in enumerate(partes, 1):
                 enviar_mensaje(chat_id, f"⏳ Subiendo parte {i}/{len(partes)}...")
                 enviar_documento(chat_id, parte, f"📦 Parte {i}/{len(partes)} de `{nombre_archivo}`")
-                try: os.remove(parte) except: pass
+                try:
+                    os.remove(parte)
+                except Exception:
+                    pass
                 
             enviar_mensaje(chat_id, f"🎉 ¡Todas las partes de `{nombre_archivo}` fueron enviadas!")
             
@@ -220,23 +226,24 @@ def proceso_descarga_y_envio(chat_id: int, url_archivo: str, nombre_archivo: str
         enviar_mensaje(chat_id, f"❌ Ocurrió un error inesperado procesando el archivo: `{str(e)}`")
     finally:
         if os.path.exists(ruta_local):
-            try: os.remove(ruta_local) except: pass
+            try:
+                os.remove(ruta_local)
+            except Exception:
+                pass
 
 # ========== INTERFAZ DE BOTONES INTERACTIVOS ==========
 def construir_teclado_directorio(carpetas: List[Dict], videos: List[Dict], subtitulos: List[Dict]) -> Dict:
     inline_keyboard = []
     
-    # Listar carpetas primero
-    for c in carpetas[:10]:  # Acotado a 10 para evitar saturar el layout de Telegram
-        inline_keyboard.append([{"text": f"📁 {c['nombre']}", "callback_data": f"exp:{c['url'][:50]}"}]) # Callback acotado por bytes
+    for c in carpetas[:10]:
+        # Para evitar exceder bytes en callback_data guardamos una porción identificatoria segura
+        inline_keyboard.append([{"text": f"📁 {c['nombre']}", "callback_data": f"dir:{c['url'][-40:]}"}])
         
-    # Listar Videos
     for v in videos[:15]:
-        inline_keyboard.append([{"text": f"🎬 {v['nombre']}", "callback_data": f"dl:{v['url'][-50:]}"}])
+        inline_keyboard.append([{"text": f"🎬 {v['nombre']}", "callback_data": f"file:{v['url'][-40:]}"}])
 
-    # Listar Subtítulos
     for s in subtitulos[:10]:
-        inline_keyboard.append([{"text": f"📝 Sub: {s['nombre']}", "callback_data": f"dl:{s['url'][-50:]}"}])
+        inline_keyboard.append([{"text": f"📝 Sub: {s['nombre']}", "callback_data": f"file:{s['url'][-40:]}"}])
         
     return {"inline_keyboard": inline_keyboard}
 
@@ -279,10 +286,9 @@ def webhook_handler():
                     enviar_mensaje(chat_id, "⚠️ No se encontraron elementos legibles o el servidor rechazó la conexión.")
                 else:
                     markup = construir_teclado_directorio(carpetas, videos, subtitulos)
-                    enviar_mensaje(chat_id, f"📂 *Resultados de:* {text}\nSelecciona un archivo para iniciar la descarga automatizada:", reply_markup=markup)
+                    enviar_mensaje(chat_id, f"📂 *Resultados de:* {text}\nSelecciona un archivo:", reply_markup=markup)
             
             elif text.startswith("/descargar"):
-                # Soporte por comando directo: /descargar [url]
                 partes_texto = text.split(" ", 1)
                 if len(partes_texto) > 1:
                     url_objetivo = partes_texto[1].strip()
@@ -293,14 +299,10 @@ def webhook_handler():
                         enviar_mensaje(chat_id, "❌ URL inválida.")
                 else:
                     enviar_mensaje(chat_id, "💡 Uso correcto: `/descargar [URL_DEL_ARCHIVO]`")
-            else:
-                enviar_mensaje(chat_id, "❓ Envía un enlace directo válido de Visuales UCLV para procesarlo.")
                 
         elif "callback_query" in update:
-            # Procesamiento de botones interactivos
-            query = update["callback_query"]
-            chat_id = query["message"]["chat"]["id"]
-            enviar_mensaje(chat_id, "⚡ Procesando solicitud interactiva de descarga por línea segura...")
+            chat_id = update["callback_query"]["message"]["chat"]["id"]
+            enviar_mensaje(chat_id, "⚡ Procesando solicitud de descarga por línea segura en segundo plano...")
             
         return jsonify({"status": "ok"}), 200
     except Exception as e:
