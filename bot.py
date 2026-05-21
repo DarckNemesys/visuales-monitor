@@ -47,7 +47,7 @@ for d in [DESCARGAS_DIR, PARTES_DIR]:
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Diccionario seguro para no perder u omitir URLs largas en botones inline de Telegram
+# Diccionario seguro para almacenar los mapeos de botones inline
 temp_urls = {}
 
 # =====================================================================
@@ -169,7 +169,6 @@ def descargar_archivo(url: str, destino: str, chat_id: Optional[int] = None,
             total_size = int(response.headers.get('content-length', 0))
             content_type = response.headers.get('content-type', '')
             
-            # Validación exacta contra los HTML de error encubiertos (220b)
             if 'text/html' in content_type and total_size < 150000:
                 if 'visuales.uclv.cu' in url:
                     url_alternativa = url.replace('visuales.uclv.cu', 'oops.uclv.edu.cu')
@@ -221,9 +220,12 @@ def dividir_archivo_nativamente(archivo_path: str) -> List[str]:
 
 def limpiar_directorios_temporales():
     for ruta_dir in [DESCARGAS_DIR, PARTES_DIR]:
-        for f in os.listdir(ruta_dir):
-            try: os.remove(os.path.join(ruta_dir, f))
-            except: pass
+        if os.path.exists(ruta_dir):
+            for f in os.listdir(ruta_dir):
+                try:
+                    os.remove(os.path.join(ruta_dir, f))
+                except Exception as e:
+                    logger.error(f"No se pudo borrar {f}: {e}")
 
 # =====================================================================
 # MÉTODOS DE COMUNICACIÓN CON LA API DE TELEGRAM
@@ -236,7 +238,8 @@ def enviar_mensaje(chat_id: int, texto: str, reply_markup: Optional[Dict] = None
         payload["reply_markup"] = reply_markup
     try:
         return requests.post(url, json=payload, timeout=15).ok
-    except:
+    except Exception as e:
+        logger.error(f"Error enviando mensaje: {e}")
         return False
 
 def enviar_documento(chat_id: int, archivo_path: str, caption: str = "") -> bool:
@@ -246,13 +249,16 @@ def enviar_documento(chat_id: int, archivo_path: str, caption: str = "") -> bool
             files = {'document': f}
             data = {'chat_id': chat_id, 'caption': caption[:1024], 'parse_mode': 'Markdown'}
             return requests.post(url, data=data, files=files, timeout=300).ok
-    except:
+    except Exception as e:
+        logger.error(f"Error enviando documento: {e}")
         return False
 
 def responder_callback(callback_id: str, texto: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery"
-    try: requests.post(url, json={"callback_query_id": callback_id, "text": texto}, timeout=10)
-    except: pass
+    try:
+        requests.post(url, json={"callback_query_id": callback_id, "text": texto}, timeout=10)
+    except Exception as e:
+        logger.error(f"Error respondiendo callback: {e}")
 
 # =====================================================================
 # CONTROLADORES DE FLUJOS INTERNOS
@@ -296,108 +302,4 @@ def ejecutar_mapeo_carpeta(chat_id: int, url_carpeta: str):
     if inline_keyboard:
         enviar_mensaje(chat_id, "📌 *Selecciona un archivo para descargar:*", {"inline_keyboard": inline_keyboard})
 
-def ejecutar_flujo_descarga(chat_id: int, url_archivo: str):
-    url_archivo = url_archivo.strip()
-    if 'visuales.uclv.cu' in url_archivo:
-        url_archivo = url_archivo.replace('visuales.uclv.cu', 'oops.uclv.edu.cu')
-        
-    if es_carpeta(url_archivo):
-        ejecutar_mapeo_carpeta(chat_id, url_archivo)
-        return
-        
-    try:
-        enviar_mensaje(chat_id, "📥 *Iniciando descarga al servidor local...*")
-        
-        # Barra de progreso nativa (múltiplos de 20%) tomada del repositorio
-        def callback_progreso(downloaded, total, filename):
-            if total > 0:
-                percent = (downloaded / total) * 100
-                if int(percent) % 20 == 0 and downloaded > 0:
-                    enviar_mensaje(chat_id, f"📥 Descargando: {percent:.0f}% ({FileUtils.format_file_size(downloaded)} de {FileUtils.format_file_size(total)})")
-                    
-        archivo, tamano = descargar_archivo(url_archivo, DESCARGAS_DIR, chat_id, callback_progreso)
-        
-        if tamano < 2048:
-            enviar_mensaje(chat_id, "❌ Error: El archivo descargado está corrupto o es una denegación de Apache.")
-            return
-            
-        if tamano <= LIMITE_2GB:
-            enviar_mensaje(chat_id, f"📤 Subiendo a Telegram: `{os.path.basename(archivo)}` ({FileUtils.format_file_size(tamano)})")
-            if enviar_documento(chat_id, archivo, f"✅ `{os.path.basename(archivo)}`"):
-                enviar_mensaje(chat_id, "🎉 ¡Completado con éxito!")
-            else:
-                enviar_mensaje(chat_id, "❌ Error al subir el documento final a Telegram.")
-        else:
-            enviar_mensaje(chat_id, f"✂️ El archivo supera los 2GB ({FileUtils.format_file_size(tamano)}). Fraccionando binario...")
-            partes = dividir_archivo_nativamente(archivo)
-            for i, parte in enumerate(partes, 1):
-                enviar_mensaje(chat_id, f"📤 Enviando parte {i}/{len(partes)}...")
-                enviar_documento(chat_id, parte, f"📦 Parte {i}/{len(partes)} - `{os.path.basename(archivo)}`")
-            enviar_mensaje(chat_id, "🎉 ¡Todas las partes fueron distribuidas!")
-            
-    except Exception as e:
-        logger.error(f"Error en flujo: {e}")
-        enviar_mensaje(chat_id, f"❌ *Error:* `{str(e)[:150]}`\n\n💡 Comprueba la URL introducida.")
-    finally:
-        limpiar_directorios_temporales()
-
-# =====================================================================
-# RUTA FLASK Y MANEJO DEL WEBHOOK
-# =====================================================================
-
-app = Flask(__name__)
-
-@app.route('/')
-def index(): return {"status": "running", "engine": "uclv_downloader_pure"}
-
-@app.route('/health')
-def health(): return "OK", 200
-
-@app.route('/webhook', methods=['POST'])
-def webhook_handler():
-    global temp_urls
-    try:
-        update = request.get_json()
-        if not update: return jsonify({"status": "empty"}), 400
-        
-        if 'callback_query' in update:
-            cb = update['callback_query']
-            chat_id = cb['message']['chat']['id']
-            data = cb['data']
-            
-            if data in temp_urls:
-                url_final = temp_urls[data]
-                responder_callback(cb['id'], "🔄 Descargando recurso seleccionado...")
-                del temp_urls[data]
-                threading.Thread(target=ejecutar_flujo_descarga, args=(chat_id, url_final)).start()
-            else:
-                responder_callback(cb['id'], "❌ La sesión de este botón expiró.")
-            return jsonify({"status": "ok"})
-            
-        if 'message' in update:
-            msg = update['message']
-            chat_id = msg['chat']['id']
-            text = msg.get('text', '').strip()
-            
-            if not text: return jsonify({"status": "ok"})
-            
-            if text == '/start':
-                teclado_pers = [["📥 Descargar"], ["🧹 Limpiar"]]
-                reply_markup = {"keyboard": teclado_pers, "resize_keyboard": True}
-                enviar_mensaje(chat_id, 
-                               "🤖 *Gestor de Descargas UCLV PRO*\n\n"
-                               "Usa el comando `/descargar <enlace>` o escribe la URL directamente para interactuar con el bot.", 
-                               reply_markup)
-                               
-            elif text == '📥 Descargar':
-                enviar_mensaje(chat_id, "📥 Envíame el comando seguido de tu enlace:\n\n`/descargar https://visuales.uclv.cu/Peliculas/Extranjeras/2026/`")
-                
-            elif text.startswith('/descargar'):
-                segmentos = text.split(maxsplit=1)
-                if len(segmentos) == 2:
-                    threading.Thread(target=ejecutar_flujo_descarga, args=(chat_id, segmentos[1])).start()
-                else:
-                    enviar_mensaje(chat_id, "⚠️ Uso incorrecto. El formato es:\n`/descargar <url_de_visuales>`")
-                    
-            elif text == '🧹 Limpiar':
-                limpiar_directorios
+def ejecutar_flujo_desc
