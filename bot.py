@@ -2,7 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-Bot de Telegram para Visuales UCLV - Solución de URLs Rota y Archivos Directos
+Bot de Telegram para Visuales UCLV - Versión Definitiva Robustecida
+Soluciona codificación de espacios en carpetas y URLs complejas.
 """
 
 import os
@@ -39,7 +40,7 @@ if WEBHOOK_URL.endswith('/'):
 URL_BASE_ESPEJO = "https://oops.uclv.edu.cu/"
 TAMANO_PARTE_MB = 1900  
 
-# Almacenamiento seguro temporal para los botones de Telegram (Evita truncar URLs)
+# Diccionario global para botones temporales
 CALLBACK_MAP = {}
 
 # Directorios de trabajo
@@ -60,21 +61,28 @@ class Extensiones:
 
 class URLUtils:
     @staticmethod
-    def corregir_url(url: str) -> str:
+    def corregir_y_limpiar_url(url: str) -> str:
         if not url:
             return ""
-        url_corregida = url.replace("https://visuales.uclv.cu", "https://oops.uclv.edu.cu")
-        url_corregida = url_corregida.replace("http://visuales.uclv.cu", "https://oops.uclv.edu.cu")
-        return url_corregida
-
-    @staticmethod
-    def construir_url_completa(base: str, href: str) -> str:
-        return urllib.parse.urljoin(base, href)
+        # 1. Traducir al espejo interno estable
+        url_limpia = url.replace("https://visuales.uclv.cu", "https://oops.uclv.edu.cu")
+        url_limpia = url_limpia.replace("http://visuales.uclv.cu", "https://oops.uclv.edu.cu")
+        
+        # 2. Decodificar por si viene parcialmente codificada y quitar espacios huérfanos
+        url_limpia = urllib.parse.unquote(url_limpia).strip()
+        
+        # 3. Codificar correctamente los caracteres especiales y espacios respetando la estructura web
+        parsed = urllib.parse.urlparse(url_limpia)
+        path_codificado = urllib.parse.quote(parsed.path)
+        
+        # Reconstruir URL válida
+        url_final = urllib.parse.urlunparse((parsed.scheme, parsed.netloc, path_codificado, parsed.params, parsed.query, parsed.fragment))
+        return url_final
 
     @staticmethod
     def es_archivo_directo(url: str) -> bool:
-        path = urllib.parse.urlparse(url).path
-        return path.lower().endswith(Extensiones.VIDEOS + Extensiones.SUBTITULOS + Extensiones.AUDIO)
+        path = urllib.parse.urlparse(url).path.lower()
+        return path.endswith(Extensiones.VIDEOS + Extensiones.SUBTITULOS + Extensiones.AUDIO)
 
 # ========== LÓGICA DE TELEGRAM (API) ==========
 def enviar_mensaje(chat_id: int, texto: str, reply_markup: Optional[Dict] = None) -> bool:
@@ -110,17 +118,19 @@ def enviar_documento(chat_id: int, archivo_path: str, caption: str) -> bool:
 
 # ========== MOTOR DE SCRAPING OPTIMIZADO ==========
 def escanear_directorio_uclv(url: str) -> Tuple[List[Dict], List[Dict], List[Dict]]:
-    url = URLUtils.corregir_url(url)
+    url = URLUtils.corregir_y_limpiar_url(url)
     if not url.endswith('/') and not URLUtils.es_archivo_directo(url):
         url += '/'
 
     carpetas, videos, subtitulos = [], [], []
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-        r = requests.get(url, headers=headers, timeout=20)
-        r.raise_for_status()
+        r = requests.get(url, headers=headers, timeout=25)
+        if r.status_code != 200:
+            logger.error(f"Servidor respondió con código: {r.status_code}")
+            return [], [], []
     except Exception as e:
-        logger.error(f"Error escaneando URL {url}: {e}")
+        logger.error(f"Error conectando a URL {url}: {e}")
         return [], [], []
 
     soup = BeautifulSoup(r.text, 'html.parser')
@@ -130,10 +140,10 @@ def escanear_directorio_uclv(url: str) -> Tuple[List[Dict], List[Dict], List[Dic
             continue
         
         nombre = urllib.parse.unquote(href)
-        url_completa = URLUtils.construir_url_completa(url, href)
+        url_completa = urllib.parse.urljoin(url, href)
         
         if href.endswith('/'):
-            carpetas.append({'nombre': nombre, 'url': url_completa})
+            carpetas.append({'nombre': nombre.replace('/', ''), 'url': url_completa})
         elif href.lower().endswith(Extensiones.VIDEOS):
             videos.append({'nombre': nombre, 'url': url_completa})
         elif href.lower().endswith(Extensiones.SUBTITULOS):
@@ -141,7 +151,7 @@ def escanear_directorio_uclv(url: str) -> Tuple[List[Dict], List[Dict], List[Dic
 
     return carpetas, videos, subtitulos
 
-# ========== MOTOR DE DESCARGA Y SEGMENTACIÓN NATIVA ==========
+# ========== MOTOR DE DESCARGA NATIVA ==========
 def descargar_archivo_streaming(url: str, destino_path: str) -> bool:
     try:
         headers = {'User-Agent': 'Mozilla/5.0'}
@@ -154,7 +164,7 @@ def descargar_archivo_streaming(url: str, destino_path: str) -> bool:
                         f.flush()
         return True
     except Exception as e:
-        logger.error(f"Fallo en descarga de {url}: {e}")
+        logger.error(f"Error en descarga streaming: {e}")
         if os.path.exists(destino_path):
             try: os.remove(destino_path)
             except Exception: pass
@@ -177,17 +187,17 @@ def dividir_archivo_nativo(archivo_path: str, tamano_mb: int = TAMANO_PARTE_MB) 
                 partes_generadas.append(nombre_parte)
                 contador += 1
     except Exception as e:
-        logger.error(f"Error segmentando: {e}")
+        logger.error(f"Error dividiendo archivo: {e}")
     return partes_generadas
 
 def proceso_descarga_y_envio(chat_id: int, url_archivo: str, nombre_archivo: str):
-    url_archivo = URLUtils.corregir_url(url_archivo)
+    url_archivo = URLUtils.corregir_y_limpiar_url(url_archivo)
     ruta_local = os.path.join(DESCARGAS_DIR, nombre_archivo)
     
     enviar_mensaje(chat_id, f"📥 *Iniciando descarga al servidor:*\n`{nombre_archivo}`")
     
     if not descargar_archivo_streaming(url_archivo, ruta_local):
-        enviar_mensaje(chat_id, f"❌ Error al descargar de la UCLV.")
+        enviar_mensaje(chat_id, f"❌ Error al descargar de la UCLV de forma segura.")
         return
 
     try:
@@ -197,26 +207,26 @@ def proceso_descarga_y_envio(chat_id: int, url_archivo: str, nombre_archivo: str
         if tamano_total <= limite_bytes:
             enviar_mensaje(chat_id, f"⚡ Subiendo a Telegram...")
             if enviar_documento(chat_id, ruta_local, f"✅ `{nombre_archivo}`"):
-                enviar_mensaje(chat_id, f"🎉 ¡Completado!")
+                enviar_mensaje(chat_id, f"🎉 ¡Completado exitosamente!")
             else:
-                enviar_mensaje(chat_id, f"❌ Error al subir.")
+                enviar_mensaje(chat_id, f"❌ Error al subir el documento.")
         else:
-            enviar_mensaje(chat_id, f"📦 Supera 2GB. Dividiendo archivo...")
+            enviar_mensaje(chat_id, f"📦 El archivo supera los 2GB. Dividiendo en partes binarias...")
             partes = dividir_archivo_nativo(ruta_local)
             for i, parte in enumerate(partes, 1):
                 enviar_mensaje(chat_id, f"⏳ Subiendo parte {i}/{len(partes)}...")
                 enviar_documento(chat_id, parte, f"📦 Parte {i}/{len(partes)} de `{nombre_archivo}`")
                 try: os.remove(parte)
                 except Exception: pass
-            enviar_mensaje(chat_id, f"🎉 ¡Todas las partes enviadas!")
+            enviar_mensaje(chat_id, f"🎉 ¡Todas las partes fueron enviadas correctamente!")
     except Exception as e:
-        enviar_mensaje(chat_id, f"❌ Error: `{str(e)}`")
+        enviar_mensaje(chat_id, f"❌ Error de procesamiento: `{str(e)}`")
     finally:
         if os.path.exists(ruta_local):
             try: os.remove(ruta_local)
             except Exception: pass
 
-# ========== INTERFAZ DE BOTONES INTERACTIVOS (CON MAPEO) ==========
+# ========== INTERFAZ DINÁMICA DE BOTONES ==========
 def construir_teclado_directorio(carpetas: List[Dict], videos: List[Dict], subtitulos: List[Dict]) -> Dict:
     inline_keyboard = []
     
@@ -237,9 +247,9 @@ def construir_teclado_directorio(carpetas: List[Dict], videos: List[Dict], subti
         
     return {"inline_keyboard": inline_keyboard}
 
-# ========== ENDPOINTS Y WEBHOOKS ==========
+# ========== ENDPOINTS DEL SERVIDOR ==========
 @app.route('/', methods=['GET'])
-def index(): return "Bot Activo", 200
+def index(): return "Bot Descargador Inteligente UCLV", 200
 
 @app.route('/health', methods=['GET'])
 def health(): return "OK", 200
@@ -256,24 +266,23 @@ def webhook_handler():
             text = message.get("text", "").strip()
             
             if text.startswith("/start") or text.startswith("/ayuda"):
-                enviar_mensaje(chat_id, "👋 Envía un enlace de carpeta o archivo directo de Visuales UCLV.")
+                enviar_mensaje(chat_id, "👋 *Bienvenido.*\nEnvía un enlace de carpeta o archivo directo de Visuales UCLV para procesarlo.")
                 
             elif "visuales.uclv.cu" in text or "oops.uclv.edu.cu" in text:
-                # DETECCIÓN DE ARCHIVO DIRECTO
-                if URLUtils.es_archivo_directo(text):
-                    nombre = urllib.parse.unquote(text.split("/")[-1])
-                    threading.Thread(target=proceso_descarga_y_envio, args=(chat_id, text, nombre)).start()
+                url_normalizada = URLUtils.corregir_y_limpiar_url(text)
+                
+                if URLUtils.es_archivo_directo(url_normalizada):
+                    nombre = urllib.parse.unquote(url_normalizada.split("/")[-1])
+                    threading.Thread(target=proceso_descarga_y_envio, args=(chat_id, url_normalizada, nombre)).start()
                 else:
-                    # ES UNA CARPETA
                     enviar_mensaje(chat_id, "🔍 Analizando directorio remoto...")
-                    if not text.endswith('/'): text += '/'
-                    carpetas, videos, subtitulos = escanear_directorio_uclv(text)
+                    carpetas, videos, subtitulos = escanear_directorio_uclv(url_normalizada)
                     
                     if not carpetas and not videos and not subtitulos:
-                        enviar_mensaje(chat_id, "⚠️ No se encontraron elementos legibles. Verifica la URL.")
+                        enviar_mensaje(chat_id, "⚠️ No se encontraron elementos legibles. Asegúrate de que la carpeta sea pública y exista.")
                     else:
                         markup = construir_teclado_directorio(carpetas, videos, subtitulos)
-                        enviar_mensaje(chat_id, "📂 Contenido disponible:", reply_markup=markup)
+                        enviar_mensaje(chat_id, f"📂 *Contenido indexado:*", reply_markup=markup)
                         
         elif "callback_query" in update:
             query = update["callback_query"]
@@ -283,18 +292,19 @@ def webhook_handler():
             url_real = CALLBACK_MAP.get(callback_data)
             if url_real:
                 if callback_data.startswith("dir_"):
+                    enviar_mensaje(chat_id, "🔍 Abriendo subcarpeta...")
                     carpetas, videos, subtitulos = escanear_directorio_uclv(url_real)
                     markup = construir_teclado_directorio(carpetas, videos, subtitulos)
-                    enviar_mensaje(chat_id, f"📂 Abriendo subcarpeta...", reply_markup=markup)
+                    enviar_mensaje(chat_id, f"📂 *Contenido de la subcarpeta:*", reply_markup=markup)
                 elif callback_data.startswith("dl_"):
                     nombre = urllib.parse.unquote(url_real.split("/")[-1])
                     threading.Thread(target=proceso_descarga_y_envio, args=(chat_id, url_real, nombre)).start()
             else:
-                enviar_mensaje(chat_id, "❌ Sesión del botón expirada. Por favor, vuelve a enviar la URL.")
+                enviar_mensaje(chat_id, "❌ El botón ha expirado. Por favor, vuelve a enviar el enlace principal.")
                 
         return jsonify({"status": "ok"}), 200
     except Exception as e:
-        logger.error(f"Error: {e}")
+        logger.error(f"Error crítico: {e}")
         return jsonify({"status": "error"}), 500
 
 def set_webhook():
