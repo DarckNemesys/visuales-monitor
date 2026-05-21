@@ -2,7 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-Monitor Recursivo de Visuales UCLV - Versión Estable
+Monitor Sincronizado de Visuales UCLV
+Rastrea de forma controlada la aparición de nuevos archivos en el repositorio.
 """
 
 from flask import Flask
@@ -28,8 +29,8 @@ URL_BASE = os.environ.get("URL_BASE", "https://oops.uclv.edu.cu/")
 if not URL_BASE.endswith("/"):
     URL_BASE += "/"
 
-SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL", 21600))  
-MAX_DEPTH = 15
+SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL", 21600))  # Cada 6 horas
+MAX_DEPTH = 10
 MAX_RETRIES = 3
 TIMEOUT = 60
 ESTADO_FILE = "estado_visuales.json"
@@ -37,16 +38,19 @@ ESTADO_FILE = "estado_visuales.json"
 def enviar_alerta_telegram(mensaje: str):
     if not TELEGRAM_TOKEN or not CHAT_ID: return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try: requests.post(url, json={"chat_id": CHAT_ID, "text": mensaje, "parse_mode": "Markdown"}, timeout=15)
-    except Exception as e: print(f"Error enviando alerta: {e}")
+    try: 
+        requests.post(url, json={"chat_id": CHAT_ID, "text": mensaje, "parse_mode": "Markdown"}, timeout=15)
+    except Exception as e: 
+        print(f"Error enviando alerta monitor: {e}")
 
 def fetch_html_con_reintentos(url: str, retries: int = MAX_RETRIES) -> Optional[str]:
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Monitor/2.0'}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     for intento in range(retries):
         try:
             r = requests.get(url, headers=headers, timeout=TIMEOUT)
             if r.status_code == 200: return r.text
-        except Exception: time.sleep(2)
+        except Exception: 
+            time.sleep(3)
     return None
 
 def mapear_servidor_recursivo(url_actual: str, profundidad_actual: int = 0) -> List[str]:
@@ -59,8 +63,10 @@ def mapear_servidor_recursivo(url_actual: str, profundidad_actual: int = 0) -> L
     for tag in soup.find_all('a'):
         href = tag.get('href')
         if not href or href in ['../', './'] or href.startswith('?'): continue
+        
         url_completa = urljoin(url_actual, href)
         if urlparse(url_completa).netloc != urlparse(URL_BASE).netloc: continue
+        
         lista_urls.append(url_completa)
         if href.endswith('/'):
             lista_urls.extend(mapear_servidor_recursivo(url_completa, profundidad_actual + 1))
@@ -86,14 +92,15 @@ def ejecutar_monitoreo():
             
             mensaje = (
                 f"📢 *CAMBIOS DETECTADOS EN VISUALES UCLV*\n\n"
-                f"🌐 *Servidor:* {URL_BASE}\n"
-                f"📊 *Total Content:* {len(urls_encontradas)} URLs\n"
-                f"➕ *Nuevas entradas detectadas:* {nuevas_entradas}\n"
+                f"🌐 *Servidor origen:* {URL_BASE}\n"
+                f"📊 *Total Elementos Indexados:* {len(urls_encontradas)} URLs\n"
+                f"➕ *Nuevos archivos detectados:* {nuevas_entradas}\n"
             )
             enviar_alerta_telegram(mensaje)
             with open(ESTADO_FILE, 'w') as f:
                 json.dump({'hash': hash_actual, 'timestamp': datetime.now().isoformat(), 'items_count': len(urls_encontradas)}, f, indent=2)
-    except Exception as e: print(f"Error en monitor: {e}")
+    except Exception as e: 
+        print(f"Error en ejecución de monitor: {e}")
 
 def daemon_scheduler():
     while True:
@@ -101,7 +108,7 @@ def daemon_scheduler():
         time.sleep(SCAN_INTERVAL)
 
 @app.route('/')
-def home(): return "Monitor Run", 200
+def home(): return "Monitor Run Activo", 200
 
 @app.route('/health')
 def health(): return "OK", 200
