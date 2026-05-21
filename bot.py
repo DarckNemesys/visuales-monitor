@@ -114,23 +114,20 @@ class FileUtils:
         filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
         return filename
 
-# ========== CORRECCIÓN HIGIÉNICA DE URLS (MÉTODO SEGURO) ==========
+# ========== CORRECCIÓN DE URLS OPTIMIZADA PARA APACHE UCLV ==========
 def corregir_url_archivo(url: str) -> str:
-    url_original = url
     url = url.strip()
     
-    # Forzar el espejo oops de la UCLV si viene el dominio antiguo
+    # Forzar el espejo oops si viene el dominio viejo
     if 'visuales.uclv.cu' in url:
         url = url.replace('visuales.uclv.cu', 'oops.uclv.edu.cu')
-        logger.info(f"URL corregida: {url_original} -> {url}")
         
-    # LOGICA DE PROTECCIÓN CONTRA CARPETAS CON ESPACIOS:
-    # Desarmamos la URL, limpiamos caracteres dobles y volvemos a aplicar escape web
     parsed = urllib.parse.urlparse(url)
-    path_limpio = urllib.parse.unquote(parsed.path)
-    path_codificado = urllib.parse.quote(path_limpio)
     
-    # Reconstrucción de la URL estructural válida para servidores Apache
+    # Decodificamos para evitar doble codificación y luego codificamos protegiendo las barras '/'
+    path_limpio = urllib.parse.unquote(parsed.path)
+    path_codificado = urllib.parse.quote(path_limpio, safe='/')
+    
     return urllib.parse.urlunparse((
         parsed.scheme, parsed.netloc, path_codificado, 
         parsed.params, parsed.query, parsed.fragment
@@ -234,7 +231,7 @@ def set_webhook():
         logger.error(f"Error en setWebhook: {e}")
         return None
 
-# ========== LOGICA DE SCRAPING EXACTA DEL REPOSITORIO (SIN ALTERAR) ==========
+# ========== LÓGICA DE SCRAPING EXACTA DEL REPOSITORIO (SIN ALTERAR) ==========
 def scrape_folder(url: str, recursive: bool = False, max_depth: int = 1) -> List[Dict]:
     items = []
     if not url.endswith('/'):
@@ -305,7 +302,6 @@ def listar_archivos_carpeta(chat_id: int, url_carpeta: str):
         botones = []
         for i, archivo in enumerate(archivos[:14]):
             nombre_corto = urllib.parse.unquote(archivo['name'])[:35]
-            # Mapeo por hash único para evitar truncados de URLs largas en la API de Telegram
             callback_id = f"dl_{hashlib.md5(archivo['url'].encode()).hexdigest()[:8]}"
             temp_urls[callback_id] = archivo['url']
             botones.append((f"{iconos.get(archivo['type'], '📄')} {nombre_corto}", callback_id))
@@ -315,7 +311,7 @@ def listar_archivos_carpeta(chat_id: int, url_carpeta: str):
         
     except Exception as e:
         logger.error(f"Error listando carpeta: {e}")
-        enviar_mensaje(chat_id, f"❌ Error al mapear directorio: {str(e)[:100]}")
+        enviar_mensaje(chat_id, f"❌ Error al evaluar directorio: {str(e)[:100]}")
 
 # ========== LÓGICA DE DESCARGA EXACTA DEL REPOSITORIO (SIN ALTERAR) ==========
 def descargar_archivo(url: str, destino: str, chat_id: Optional[int] = None,
@@ -339,7 +335,6 @@ def descargar_archivo(url: str, destino: str, chat_id: Optional[int] = None,
             total_size = int(response.headers.get('content-length', 0))
             content_type = response.headers.get('content-type', '')
             
-            # Validación nativa para prevenir descargas corruptas de páginas de error de 220b
             if 'text/html' in content_type and total_size < 150000:
                 if 'visuales' in url_limpia:
                     url_alternativa = url_limpia.replace('visuales.uclv.cu', 'oops.uclv.edu.cu')
@@ -393,7 +388,6 @@ def procesar_descarga(chat_id: int, url: str):
     try:
         enviar_mensaje(chat_id, f"📥 *Descargando binario al servidor...*")
         
-        # Callback exacto de barra de progreso interactiva múltiplos de 20%
         def progreso(downloaded, total, filename):
             if total > 0:
                 percent = (downloaded / total) * 100
@@ -403,7 +397,7 @@ def procesar_descarga(chat_id: int, url: str):
         archivo, tamaño = descargar_archivo(url, DESCARGAS_DIR, chat_id, progreso)
         
         if tamaño < 2048:
-            enviar_mensaje(chat_id, f"❌ Descarga corrupta. El enlace arrojó una respuesta inválida del servidor universitario.")
+            enviar_mensaje(chat_id, f"❌ Descarga corrupta. Respuesta inválida del servidor universitario.")
             return
         
         if tamaño <= LIMITE_2GB:
