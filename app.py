@@ -17,6 +17,7 @@ import json
 from datetime import datetime
 from dotenv import load_dotenv
 from urllib.parse import urljoin, urlparse
+from typing import List, Optional  # <--- CORREGIDO: Importación añadida con éxito
 
 load_dotenv()
 
@@ -25,12 +26,12 @@ app = Flask(__name__)
 # ========== CONFIGURACIÓN ==========
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
-URL_BASE = os.environ.get("URL_BASE", "https://oops.uclv.edu.cu/") # Cambiado por defecto al espejo estable
+URL_BASE = os.environ.get("URL_BASE", "https://oops.uclv.edu.cu/")
 
 if not URL_BASE.endswith("/"):
     URL_BASE += "/"
 
-SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL", 21600))  # Cada 6 horas por defecto
+SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL", 21600))  # Cada 6 horas
 MAX_DEPTH = 15
 MAX_RETRIES = 3
 TIMEOUT = 60
@@ -76,13 +77,11 @@ def mapear_servidor_recursivo(url_actual: str, profundidad_actual: int = 0) -> L
             
         url_completa = urljoin(url_actual, href)
         
-        # Filtrar para mantener el rastreo dentro del dominio universitario
         if urlparse(url_completa).netloc != urlparse(URL_BASE).netloc:
             continue
 
         lista_urls.append(url_completa)
         
-        # Si es una carpeta, descender recursivamente
         if href.endswith('/'):
             lista_urls.extend(mapear_servidor_recursivo(url_completa, profundidad_actual + 1))
             
@@ -91,7 +90,6 @@ def mapear_servidor_recursivo(url_actual: str, profundidad_actual: int = 0) -> L
 def ejecutar_monitoreo():
     print(f"Iniciando ciclo de escaneo profundo en: {URL_BASE}")
     try:
-        # Cargar estado previo
         estado_previo = {}
         if os.path.exists(ESTADO_FILE):
             try:
@@ -100,14 +98,12 @@ def ejecutar_monitoreo():
             except Exception:
                 estado_previo = {}
 
-        # Mapeo en tiempo real
         urls_encontradas = sorted(list(set(mapear_servidor_recursivo(URL_BASE))))
         
         if not urls_encontradas:
             print("Escaneo vacío. Posible caída del servidor origen.")
             return
 
-        # Generar firma única de control (Hash MD5)
         cadena_control = "".join(urls_encontradas).encode('utf-8')
         hash_actual = hashlib.md5(cadena_control).hexdigest()
 
@@ -125,7 +121,6 @@ def ejecutar_monitoreo():
             )
             enviar_alerta_telegram(mensaje)
             
-            # Persistir cambios en disco local
             with open(ESTADO_FILE, 'w') as f:
                 json.dump({
                     'hash': hash_actual,
@@ -145,7 +140,6 @@ def daemon_scheduler():
         print(f"Durmiendo el monitor por {SCAN_INTERVAL} segundos...")
         time.sleep(SCAN_INTERVAL)
 
-# Servidor básico para responder Pings de Render/UptimeKuma
 @app.route('/')
 def home():
     return "Servicio Daemon: Monitor de Cambios UCLV - Ejecutándose en Background", 200
@@ -155,7 +149,6 @@ def health():
     return "OK", 200
 
 if __name__ == "__main__":
-    # Iniciar el planificador en un hilo alterno para no bloquear el puerto HTTP
     t = threading.Thread(target=daemon_scheduler, daemon=True)
     t.start()
     
